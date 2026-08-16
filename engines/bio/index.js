@@ -2297,6 +2297,13 @@
         getConfig: () => cfg,
         getLogs: () => logs.slice(-200),
         getLastSignal: () => lastInjectText || '',
+        // 供 Core 第二层设置/API 页读写真实配置与状态
+        saveConfig: () => saveCfg(),
+        resetState: () => { snapshot = emptySnap(); saveSnap(); addLog('system', '状态已清空'); },
+        clearLogs: () => { logs = []; saveLogs(); addLog('system', '日志已清空'); },
+        getLearnedRules: () => loadLearnedRules(),
+        saveLearnedRules: (arr) => saveLearnedRules(arr),
+        fetchModels: () => fetchModelList(),
         // 已收编进 Core：不暴露旧窗/悬浮球入口
         openPanel: () => {},
         togglePanel: () => {},

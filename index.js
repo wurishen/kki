@@ -194,7 +194,7 @@
     const wrap = document.createElement('div'); wrap.id = 'pyramid-core-panel'; wrap.className = 'pyramid-core-panel'; wrap.innerHTML = `
       <div class="pc-head"><b>🔺 Pyramid Core</b><span>Unified v${VERSION}</span><button id="pc-close">×</button></div>
       <div class="pc-body">
-        <div class="pc-tabs">
+        <div class="pc-tabs pc-maintabs">
           <button class="pc-tab pc-on" data-tab="status">状态</button>
           <button class="pc-tab" data-tab="signal">信号</button>
           <button class="pc-tab" data-tab="log">日志</button>
@@ -206,8 +206,8 @@
             <div><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
             <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
+          <button id="pc-bio-enter">🧬 进入 BIO 模块</button>
           <div class="pc-row">
-            <button id="pc-refresh-bio">🔄 刷新 BIO 状态</button>
             <button id="pc-open-novel">打开 Novel</button>
             <button id="pc-open-memory">打开 Memory</button>
           </div>
@@ -220,9 +220,7 @@
         </div>
 
         <div class="pc-pane" data-pane="signal" hidden>
-          <div class="pc-hint">身体只上交短信号，是否处理由主脑决定。</div>
-          <button id="pc-bio-submit">手动提交当前 BIO 状态到提示词</button>
-          <button id="pc-bio-read">立即总结近文并判断</button>
+          <div class="pc-hint">统一认知包：身体/记忆信号汇总，是否处理由主脑决定。</div>
           <button id="pc-pack">生成当前认知包</button>
           <button id="pc-clear">清除本轮信号（阅后即焚）</button>
           <pre id="pc-log"></pre>
@@ -238,6 +236,89 @@
           </div>
           <pre id="pc-events"></pre>
         </div>
+
+        <div class="pc-pane" data-pane="bio" hidden>
+          <div class="pc-bio-bar">
+            <button id="pc-bio-back">← 返回主界面</button>
+            <span>🧬 BIO 模块</span>
+          </div>
+          <div class="pc-tabs pc-bio-tabs">
+            <button class="pc-bio-tab pc-on" data-bv="status">状态</button>
+            <button class="pc-bio-tab" data-bv="action">操作</button>
+            <button class="pc-bio-tab" data-bv="log">日志</button>
+            <button class="pc-bio-tab" data-bv="settings">设置</button>
+            <button class="pc-bio-tab" data-bv="api">API</button>
+          </div>
+
+          <div class="pc-bio-pane" data-bv-pane="status">
+            <div class="pc-row"><button id="pc-bio-refresh2">🔄 刷新状态</button></div>
+            <div id="pc-bio-status-full"></div>
+          </div>
+
+          <div class="pc-bio-pane" data-bv-pane="action" hidden>
+            <div class="pc-hint">先「立即总结近文并判断」，再视需要「手动提交当前状态到提示词」。</div>
+            <button id="pc-bio-read2">立即总结近文并判断</button>
+            <button id="pc-bio-submit2">手动提交当前状态到提示词</button>
+            <button id="pc-bio-clear2">清除本轮信号（阅后即焚）</button>
+            <pre id="pc-bio-result"></pre>
+          </div>
+
+          <div class="pc-bio-pane" data-bv-pane="log" hidden>
+            <div class="pc-row">
+              <button class="pc-bf pc-on" data-bf="all">全部</button>
+              <button class="pc-bf" data-bf="summary">summary</button>
+              <button class="pc-bf" data-bf="signal">signal</button>
+              <button class="pc-bf" data-bf="report">report</button>
+              <button class="pc-bf" data-bf="quiet">quiet</button>
+              <button class="pc-bf" data-bf="rules">rules</button>
+              <button class="pc-bf" data-bf="error">error</button>
+            </div>
+            <button id="pc-bio-clear-log">清空日志</button>
+            <pre id="pc-bio-events"></pre>
+          </div>
+
+          <div class="pc-bio-pane" data-bv-pane="settings" hidden>
+            <div class="pc-hint">观察项与阈值（沿用 BIO 配置）</div>
+            <label class="pc-check"><input type="checkbox" data-bk="drink"> 饮水</label>
+            <label class="pc-check"><input type="checkbox" data-bk="meal"> 进食</label>
+            <label class="pc-check"><input type="checkbox" data-bk="urination"> 排尿</label>
+            <label class="pc-check"><input type="checkbox" data-bk="bowel_movement"> 排便</label>
+            <label class="pc-check"><input type="checkbox" data-bk="sleep"> 睡眠</label>
+            <label class="pc-check"><input type="checkbox" data-bf="trackReproductive"> 经期/受孕/孕期</label>
+            <label class="pc-check"><input type="checkbox" data-bf="offscreenAdvance"> 离场仍推进时间</label>
+            <label class="pc-check"><input type="checkbox" data-bf="injectEnabled"> 写入主创提示词</label>
+            <label class="pc-check"><input type="checkbox" data-bf="hardSync"> 防脱钩约束</label>
+            <label class="pc-field">上报最低阶段
+              <select data-bsel="reportMinStage">
+                <option value="关注">关注（较敏感）</option>
+                <option value="迫切">迫切（推荐）</option>
+                <option value="应急">应急（很少打扰）</option>
+              </select>
+            </label>
+            <label class="pc-field">自动读取间隔（轮）<input type="number" data-bnum="autoEvery" min="1"></label>
+            <label class="pc-field">日志保留条数<input type="number" data-bnum="logMax" min="10"></label>
+            <div class="pc-row"><button id="pc-bio-save-settings">保存设置</button><button id="pc-bio-reset">清空全部状态</button></div>
+          </div>
+
+          <div class="pc-bio-pane" data-bv-pane="api" hidden>
+            <div class="pc-hint">独立 API（近文总结/判断用，沿用 BIO 配置）</div>
+            <label class="pc-field">Base URL<input type="text" data-bapi="baseUrl"></label>
+            <label class="pc-field">API Key<input type="password" data-bapi="apiKey"></label>
+            <label class="pc-field">模型<input type="text" data-bapi="model"></label>
+            <label class="pc-field">手动模型名（可选）<input type="text" data-bapi="modelManual"></label>
+            <label class="pc-check"><input type="checkbox" data-bf="sideApiEnabled"> 启用独立 API</label>
+            <label class="pc-check"><input type="checkbox" data-bf="rulesEnabled"> 禁令层</label>
+            <label class="pc-field">禁令扫描间隔（轮）<input type="number" data-bnum="rulesEvery" min="1"></label>
+            <div class="pc-field">禁令经验库：<span id="pc-bio-learned-count">0</span> 条</div>
+            <div class="pc-row">
+              <button id="pc-bio-export-learned">导出经验库</button>
+              <button id="pc-bio-import-learned">导入经验库</button>
+              <button id="pc-bio-clear-learned">清空</button>
+              <input type="file" id="pc-bio-learned-file" accept="application/json,.json" style="display:none">
+            </div>
+            <button id="pc-bio-save-api">保存 API 设置</button>
+          </div>
+        </div>
       </div>`;
     document.body.appendChild(wrap);
 
@@ -249,19 +330,15 @@
     const BIO_STAGE = ['平稳', '关注', '迫切', '应急'];
     const bioRank = (s) => { const i = BIO_STAGE.indexOf(String(s || '')); return i < 0 ? 0 : i; };
     const bioCls = (s) => { const r = bioRank(s); return r >= 3 ? 'pc-s-emerg' : (r >= 2 ? 'pc-s-urgent' : (r >= 1 ? 'pc-s-watch' : 'pc-s-ok')); };
-    function renderBioStatus() {
-      const el = $('pc-bio-status'); if (!el) return;
+    function bioStatusCards() {
       const api = window.PyramidBio;
-      if (!api?.getSnapshot) { el.innerHTML = '<div class="pc-hint">BIO 引擎未就绪，无法显示状态。</div>'; return; }
+      if (!api?.getSnapshot) return '<div class="pc-hint">BIO 引擎未就绪，无法显示状态。</div>';
       const snap = api.getSnapshot() || {};
       const cfg = api.getConfig?.() || {};
       const chars = Object.entries(snap.characters || {}).filter(([,c]) => c);
-      if (!chars.length) {
-        el.innerHTML = '<div class="pc-hint">暂无已跟踪角色。在「信号」页点「立即总结近文并判断」后会收录。</div>';
-        return;
-      }
+      if (!chars.length) return '<div class="pc-hint">暂无已跟踪角色。在 BIO 模块「操作」页点「立即总结近文并判断」后会收录。</div>';
       const needs = Array.isArray(cfg.enabledNeeds) && cfg.enabledNeeds.length ? cfg.enabledNeeds : Object.keys(BIO_NEED_LABEL);
-      el.innerHTML = chars.map(([name, ch]) => {
+      return chars.map(([name, ch]) => {
         let tag = '';
         if (ch.pregnancy?.active) tag = '孕';
         else if (ch.menstrual_cycle?.phase === '月经期') tag = '经';
@@ -284,6 +361,12 @@
         </div>`;
       }).join('');
     }
+    function renderBioStatus() {
+      const el = $('pc-bio-status'); if (el) el.innerHTML = bioStatusCards();
+    }
+    function renderBioStatusFull() {
+      const el = $('pc-bio-status-full'); if (el) el.innerHTML = bioStatusCards();
+    }
 
     const set = () => {
       const s = window.PyramidCore.getStatus();
@@ -293,14 +376,162 @@
       renderBioStatus();
     };
 
-    // 分页
+    // 主层分页
+    let bioActive = false;
+    function showPane(name) {
+      wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== name; });
+      if (name === 'log') renderEvents();
+      if (name === 'bio') renderBioStatusFull();
+    }
+    function enterBio() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('bio'); }
+    function exitBio() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
     wrap.querySelectorAll('.pc-tab').forEach(btn => btn.onclick = () => {
+      if (bioActive) exitBio();
       wrap.querySelectorAll('.pc-tab').forEach(b => b.classList.toggle('pc-on', b === btn));
-      wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== btn.dataset.tab; });
-      if (btn.dataset.tab === 'log') renderEvents();
+      showPane(btn.dataset.tab);
     });
 
-    // 日志：来自各引擎经 Core 汇合的事件
+    // BIO 第二层分页
+    function switchBioView(bv) {
+      wrap.querySelectorAll('.pc-bio-tab').forEach(b => b.classList.toggle('pc-on', b.dataset.bv === bv));
+      wrap.querySelectorAll('.pc-bio-pane').forEach(p => { p.hidden = p.dataset.bvPane !== bv; });
+      if (bv === 'status') renderBioStatusFull();
+      if (bv === 'log') renderBioEvents();
+      if (bv === 'settings') loadBioSettings();
+      if (bv === 'api') loadBioApi();
+    }
+    wrap.querySelectorAll('.pc-bio-tab').forEach(b => b.onclick = () => switchBioView(b.dataset.bv));
+    $('pc-bio-enter').onclick = enterBio;
+    $('pc-bio-back').onclick = exitBio;
+    $('pc-bio-refresh2').onclick = () => { renderBioStatusFull(); $('pc-bio-result').textContent = 'BIO 状态已刷新。'; };
+
+    // BIO 操作
+    $('pc-bio-read2').onclick = async () => {
+      const api = window.PyramidBio;
+      const out = $('pc-bio-result');
+      if (!api?.readFromChat) { out.textContent = 'BIO 引擎未就绪。'; return; }
+      out.textContent = '正在总结近文…（先总结再判断，不会无总结乱报）';
+      try { await api.readFromChat(true); out.textContent = '总结完成，结果见「日志」分页。'; }
+      catch (e) { out.textContent = '总结失败：' + e.message; }
+      renderBioStatusFull(); renderBioEvents(); renderEvents();
+    };
+    $('pc-bio-submit2').onclick = () => {
+      const api = window.PyramidBio;
+      const out = $('pc-bio-result');
+      if (!api?.forceSubmit) { out.textContent = 'BIO 引擎未就绪，无法提交。'; return; }
+      try {
+        api.forceSubmit();
+        const sig = window.PyramidCore.bioSignal || api.getLastSignal?.() || '';
+        out.textContent = sig ? '已提交，本轮提示词中的信号：\n\n' + sig : '已提交，但当前没有达到阈值的信号（无信号不主动演三急）。';
+      } catch (e) { out.textContent = '提交失败：' + e.message; }
+      renderBioEvents(); renderEvents();
+    };
+    $('pc-bio-clear2').onclick = () => { window.PyramidCore.clearBioSignal(); $('pc-bio-result').textContent = '已清除本轮 BIO 信号。'; };
+
+    // BIO 日志
+    let bioLogFilter = 'all';
+    function renderBioEvents() {
+      const el = $('pc-bio-events'); if (!el) return;
+      const rows = (window.PyramidBio?.getLogs?.() || [])
+        .filter(l => bioLogFilter === 'all' || l.type === bioLogFilter)
+        .slice().reverse().slice(0, 60)
+        .map(l => `[${l.time}] ${l.type}  ${l.msg}`);
+      el.textContent = rows.length ? rows.join('\n') : '暂无日志（产生总结/信号后会出现在这里）。';
+    }
+    wrap.querySelectorAll('.pc-bf').forEach(b => b.onclick = () => {
+      bioLogFilter = b.dataset.bf;
+      wrap.querySelectorAll('.pc-bf').forEach(x => x.classList.toggle('pc-on', x === b));
+      renderBioEvents();
+    });
+    $('pc-bio-clear-log').onclick = () => { window.PyramidBio?.clearLogs?.(); renderBioEvents(); };
+
+    // BIO 设置（读/写真实 cfg）
+    function bioCfg() { return window.PyramidBio?.getConfig?.(); }
+    function loadBioSettings() {
+      const cfg = bioCfg(); if (!cfg) return;
+      wrap.querySelectorAll('[data-bk]').forEach(el => { el.checked = cfg.enabledNeeds.includes(el.dataset.bk); });
+      wrap.querySelectorAll('[data-bf]').forEach(el => { el.checked = !!cfg[el.dataset.bf]; });
+      const sel = wrap.querySelector('[data-bsel=reportMinStage]'); if (sel) sel.value = cfg.reportMinStage || '迫切';
+      const an = wrap.querySelector('[data-bnum=autoEvery]'); if (an) an.value = cfg.autoEvery ?? 3;
+      const lm = wrap.querySelector('[data-bnum=logMax]'); if (lm) lm.value = cfg.logMax ?? 80;
+    }
+    $('pc-bio-save-settings').onclick = () => {
+      const cfg = bioCfg(); if (!cfg) { return; }
+      cfg.enabledNeeds = Object.keys({ drink:1, meal:1, urination:1, bowel_movement:1, sleep:1 }).filter(k => wrap.querySelector(`[data-bk="${k}"]`)?.checked);
+      wrap.querySelectorAll('[data-bf]').forEach(el => { cfg[el.dataset.bf] = !!el.checked; });
+      const sel = wrap.querySelector('[data-bsel=reportMinStage]'); if (sel) cfg.reportMinStage = sel.value;
+      const an = wrap.querySelector('[data-bnum=autoEvery]'); if (an) cfg.autoEvery = parseInt(an.value, 10) || 3;
+      const lm = wrap.querySelector('[data-bnum=logMax]'); if (lm) cfg.logMax = parseInt(lm.value, 10) || 80;
+      window.PyramidBio?.saveConfig?.();
+      renderBioStatusFull();
+      $('pc-bio-result').textContent = '观察项与阈值已保存。';
+    };
+    $('pc-bio-reset').onclick = () => {
+      if (!confirm('确认清空全部生理状态？')) return;
+      window.PyramidBio?.resetState?.();
+      renderBioStatusFull();
+      $('pc-bio-result').textContent = '状态已清空。';
+    };
+
+    // BIO API 设置
+    function loadBioApi() {
+      const cfg = bioCfg(); if (!cfg) return;
+      wrap.querySelectorAll('[data-bapi]').forEach(el => { el.value = cfg[el.dataset.bapi] || ''; });
+      wrap.querySelectorAll('[data-bf]').forEach(el => { el.checked = !!cfg[el.dataset.bf]; });
+      const re = wrap.querySelector('[data-bnum=rulesEvery]'); if (re) re.value = cfg.rulesEvery ?? 2;
+      renderLearnedCount();
+    }
+    function renderLearnedCount() {
+      const el = $('pc-bio-learned-count'); if (el) el.textContent = String(window.PyramidBio?.getLearnedRules?.().length ?? 0);
+    }
+    $('pc-bio-save-api').onclick = () => {
+      const cfg = bioCfg(); if (!cfg) { return; }
+      wrap.querySelectorAll('[data-bapi]').forEach(el => {
+        if (el.dataset.bapi === 'modelManual') return;
+        cfg[el.dataset.bapi] = el.value;
+      });
+      const manual = wrap.querySelector('[data-bapi=modelManual]')?.value?.trim();
+      if (manual) cfg.model = manual;
+      wrap.querySelectorAll('[data-bf]').forEach(el => { cfg[el.dataset.bf] = !!el.checked; });
+      const re = wrap.querySelector('[data-bnum=rulesEvery]'); if (re) cfg.rulesEvery = parseInt(re.value, 10) || 2;
+      window.PyramidBio?.saveConfig?.();
+      $('pc-bio-result').textContent = 'API 设置已保存。';
+    };
+    $('pc-bio-export-learned').onclick = () => {
+      const list = window.PyramidBio?.getLearnedRules?.() || [];
+      const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), items: list }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'rpe-rule-memory-' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.appendChild(a); a.click(); setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch (_) {} }, 800);
+    };
+    const learnedFile = $('pc-bio-learned-file');
+    $('pc-bio-import-learned').onclick = () => learnedFile?.click();
+    learnedFile.onchange = async () => {
+      const f = learnedFile.files && learnedFile.files[0]; learnedFile.value = '';
+      if (!f) return;
+      try {
+        const data = JSON.parse(await f.text());
+        const incoming = Array.isArray(data) ? data : (Array.isArray(data.items) ? data.items : []);
+        const cur = window.PyramidBio?.getLearnedRules?.() || [];
+        const map = new Map(cur.map(x => [x.sig, x]));
+        let added = 0;
+        for (const it of incoming) {
+          if (!it || typeof it !== 'object') continue;
+          const sig = it.sig || ((Array.isArray(it.ids) ? it.ids.join(',') : '') + '|' + (it.reason || ''));
+          if (!sig || sig === '|') continue;
+          if (!map.has(sig)) { map.set(sig, it); added++; }
+        }
+        window.PyramidBio?.saveLearnedRules?.(Array.from(map.values()));
+        renderLearnedCount();
+        $('pc-bio-result').textContent = '已导入禁令经验库 +' + added + ' 新条。';
+      } catch (e) { $('pc-bio-result').textContent = '导入失败：' + (e.message || e); }
+    };
+    $('pc-bio-clear-learned').onclick = () => { window.PyramidBio?.saveLearnedRules?.([]); renderLearnedCount(); $('pc-bio-result').textContent = '禁令经验库已清空。'; };
+
+    // Core 主层信号
+    $('pc-pack').onclick = () => { const p = compileCognitivePack(); $('pc-log').textContent = p || '当前没有可注入的统一数据。'; };
+    $('pc-clear').onclick = () => { window.PyramidCore.clearBioSignal(); $('pc-log').textContent = '已清除本轮 BIO 信号。'; };
+
+    // 主层日志：来自各引擎经 Core 汇合的事件
     let logFilter = 'all';
     function renderEvents() {
       const el = $('pc-events'); if (!el) return;
@@ -322,27 +553,6 @@
     });
 
     $('pc-close').onclick = () => wrap.classList.remove('open');
-    $('pc-pack').onclick = () => { const p = compileCognitivePack(); $('pc-log').textContent = p || '当前没有可注入的统一数据。'; };
-    $('pc-clear').onclick = () => { window.PyramidCore.clearBioSignal(); $('pc-log').textContent = '已清除本轮 BIO 信号。'; };
-    $('pc-bio-submit').onclick = () => {
-      const api = window.PyramidBio;
-      if (!api?.forceSubmit) { $('pc-log').textContent = 'BIO 引擎未就绪，无法提交。'; return; }
-      try {
-        api.forceSubmit();
-        const sig = window.PyramidCore.bioSignal || api.getLastSignal?.() || '';
-        $('pc-log').textContent = sig ? '已提交，本轮提示词中的信号：\n\n' + sig : '已提交，但当前没有达到阈值的信号（无信号不主动演三急）。';
-      } catch (e) { $('pc-log').textContent = '提交失败：' + e.message; }
-      renderEvents();
-    };
-    $('pc-bio-read').onclick = async () => {
-      const api = window.PyramidBio;
-      if (!api?.readFromChat) { $('pc-log').textContent = 'BIO 引擎未就绪。'; return; }
-      $('pc-log').textContent = '正在总结近文…（先总结再判断，不会无总结乱报）';
-      try { await api.readFromChat(true); $('pc-log').textContent = '总结完成，详见「日志」分页。'; }
-      catch (e) { $('pc-log').textContent = '总结失败：' + e.message; }
-      renderEvents();
-    };
-    $('pc-refresh-bio').onclick = () => { renderBioStatus(); $('pc-log').textContent = 'BIO 状态已刷新（内嵌，不再打开旧面板）。'; };
     $('pc-open-novel').onclick = () => {
       const el = document.getElementById('ni-fab');
       if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }
@@ -365,7 +575,7 @@
     $('pc-export').onclick = () => { const blob = new Blob([JSON.stringify({ version: VERSION, state, status: window.PyramidCore.getStatus() }, null, 2)], {type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'pyramid-core-state.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); };
 
     set();
-    window.PyramidCore.refreshUI = () => { try { set(); renderEvents(); } catch (_) {} };
+    window.PyramidCore.refreshUI = () => { try { set(); renderEvents(); renderBioStatusFull(); } catch (_) {} };
     window.PyramidCore.openPanel = () => { wrap.classList.add('open'); set(); };
     const fab = document.createElement('button'); fab.id='pyramid-core-fab'; fab.textContent='🔺'; fab.title='Pyramid Core'; fab.onclick=()=>{ wrap.classList.toggle('open'); set(); }; document.body.appendChild(fab);
     hideChildFabs();

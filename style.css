@@ -16458,3 +16458,21 @@ select.ni-modal-input {
 .pc-s-watch{background:rgba(230,180,70,.16);color:#e8c06a;border-color:rgba(230,180,70,.4)}
 .pc-s-urgent{background:rgba(235,130,70,.18);color:#f0a26a;border-color:rgba(235,130,70,.45)}
 .pc-s-emerg{background:rgba(230,80,80,.2);color:#f08a8a;border-color:rgba(230,80,80,.5)}
+/* BIO 第二层模块：可滚动、可返回，手机宽度可用 */
+.pyramid-core-panel.pc-bio-mode .pc-maintabs{display:none}
+.pc-bio-bar{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.pc-bio-bar span{font-size:12px;opacity:.8;flex:1}
+.pc-bio-bar button{width:auto;flex:0 0 auto;min-width:0;padding:6px 10px;font-size:12px;background:#2a2a35;border:1px solid #5a5a6a;border-radius:7px;color:#fff}
+.pc-bio-tabs{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px;border-bottom:1px solid #444;padding-bottom:6px}
+.pc-body .pc-bio-tabs button.pc-bio-tab{width:auto;flex:0 0 auto;min-width:0;margin:0;padding:5px 9px;font-size:11px;background:#22222a;border:1px solid #4a4a55;border-radius:7px;opacity:.7}
+.pc-body .pc-bio-tabs button.pc-bio-tab.pc-on{opacity:1;background:#35354a;border-color:#7a7ad0;color:#fff}
+.pc-bio-pane[hidden]{display:none}
+.pc-bio-pane{padding:2px 0}
+.pc-body .pc-bio-pane button{width:auto;min-width:88px;margin:4px;padding:8px}
+.pc-body .pc-bio-pane button.pc-bf{flex:0 0 auto;min-width:0;padding:5px 8px;opacity:.6;background:#22222a}
+.pc-body .pc-bio-pane button.pc-bf.pc-on{opacity:1;background:#35354a;border-color:#7a7ad0}
+.pc-bio-pane pre{white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto;font-size:11px;opacity:.85;background:rgba(0,0,0,.3);border:1px solid #3a3a44;border-radius:7px;padding:6px;margin:4px}
+.pc-field{display:block;font-size:11px;opacity:.85;margin:6px 0}
+.pc-field input,.pc-field select{width:100%;margin-top:3px;padding:5px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#eee;font-size:11px;box-sizing:border-box}
+.pc-bio-pane .pc-check{display:flex;align-items:center;gap:6px;margin:5px 0;font-size:11px}
+.pc-bio-pane .pc-check input{width:auto;margin:0}
