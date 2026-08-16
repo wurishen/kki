@@ -12585,3 +12585,9 @@
 .pc-grid .pc-bio-box:hover{background:#35354a;border-color:#7a7ad0}
 #pc-bio-events{max-height:130px;min-height:84px;overflow:auto}
 #pc-bio-model-list{width:auto;flex:0 0 auto;min-width:120px;margin:4px;padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#eee;font-size:11px}
+.pc-char-row{display:flex;align-items:center;gap:6px;padding:5px 6px;margin:3px 0;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(0,0,0,.2)}
+.pc-char-row b{font-size:12px;flex:0 0 auto;min-width:70px}
+.pc-char-row span{flex:1;font-size:11px;opacity:.7;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pc-char-row button{width:auto;flex:0 0 auto;min-width:0;margin:0;padding:3px 9px;font-size:11px;background:#29292f;border:1px solid #555;border-radius:6px;color:#fff;cursor:pointer}
+.pc-char-row button:hover{background:#35354a;border-color:#7a7ad0}
+#pc-memory-maint{max-height:40vh;overflow:auto}

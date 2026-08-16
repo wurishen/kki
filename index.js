@@ -313,6 +313,7 @@
           <div class="pc-tabs pc-bio-tabs">
             <button class="pc-bio-tab pc-on" data-mv="status">状态</button>
             <button class="pc-bio-tab" data-mv="log">日志</button>
+            <button class="pc-bio-tab" data-mv="maint">维护</button>
           </div>
 
           <div class="pc-bio-pane" data-mv-pane="status">
@@ -325,6 +326,12 @@
 
           <div class="pc-bio-pane" data-mv-pane="log" hidden>
             <pre id="pc-memory-events"></pre>
+          </div>
+
+          <div class="pc-bio-pane" data-mv-pane="maint" hidden>
+            <div class="pc-hint">维护能力：直接调用原记忆引擎的 Storage/CharacterGraph 接口读写，不重写向量/填表算法。</div>
+            <button id="pc-memory-maint-refresh">🔄 刷新</button>
+            <div id="pc-memory-maint"></div>
           </div>
         </div>
       </div>`;
@@ -422,6 +429,7 @@
       wrap.querySelectorAll('[data-mv-pane]').forEach(p => { p.hidden = p.dataset.mvPane !== mv; });
       if (mv === 'status') renderMemoryStatus();
       if (mv === 'log') renderMemoryEvents();
+      if (mv === 'maint') renderMemoryMaint();
     }
     function renderMemoryStatus() {
       const el = $('pc-memory-status'); if (!el) return;
@@ -457,6 +465,121 @@
       window.YuzukiMemory?.LogViewer?.clearLogs?.();
       renderMemoryEvents(); renderMemoryStatus();
     };
+
+    // Memory 维护：仅调用原引擎已暴露的 Storage/CharacterGraph/MemoryIO 接口
+    function memStorage() { return window.YuzukiMemory?.Storage; }
+    function memCharGraph() { return window.YuzukiMemory?.CharacterGraph; }
+    function memState() {
+      const s = memStorage();
+      if (!s?.loadState) return null;
+      return s.loadState({ tables: [], records: {} }, s.getCurrentSessionId?.());
+    }
+    function memSaveState(state) {
+      const s = memStorage();
+      if (!s?.saveState) return false;
+      return s.saveState(state, state, s.getCurrentSessionId?.(), { force: true });
+    }
+    const MEM_CHAR_COLUMNS = ['角色名', '年龄', '性别', '身份', '性格', '当前位置', '周围角色', '生理', '人际关系', '着装', '待办事项', '约定'];
+    function memColClean(v) { return String(v ?? '').trim().replace(/^[#*]+/, '').trim(); }
+    function memCharRecords(state) {
+      const arr = memCharGraph()?.getCharacterRecords?.(state);
+      return Array.isArray(arr) ? arr : (Array.isArray(state?.records?.character_profile) ? state.records.character_profile : []);
+    }
+    function memEditChar(id) {
+      const state = memState();
+      if (!state) return;
+      const rec = memCharRecords(state).find(r => String(r.id) === String(id));
+      if (!rec) return;
+      const cols = state.tables?.find(t => t.id === 'character_profile')?.columns || MEM_CHAR_COLUMNS;
+      const html = cols.map(c => {
+        const k = memColClean(c);
+        const val = escHtml(rec.values?.[k] ?? '');
+        return `<label class="pc-field">${escHtml(k)}<input type="text" data-cfield="${escHtml(k)}" value="${val}"></label>`;
+      }).join('');
+      const el = $('pc-memory-maint');
+      el.innerHTML = `<div class="pc-hint">编辑人物：${escHtml(rec.values?.角色名 || rec.id)}</div>${html}
+        <div class="pc-row"><button id="pc-mem-char-save">保存</button><button id="pc-mem-char-cancel">取消</button></div>`;
+      $('pc-mem-char-cancel').onclick = renderMemoryMaint;
+      $('pc-mem-char-save').onclick = () => {
+        const st = memState(); const r = memCharRecords(st).find(x => String(x.id) === String(id));
+        if (!r) return;
+        el.querySelectorAll('[data-cfield]').forEach(inp => { r.values[inp.dataset.cfield] = inp.value; });
+        memSaveState(st);
+        renderMemoryMaint();
+      };
+    }
+    function memDelChar(id) {
+      const state = memState();
+      if (!state) return;
+      const next = memCharRecords(state).filter(r => String(r.id) !== String(id));
+      state.records.character_profile = next;
+      if (state.activeRecordIds) delete state.activeRecordIds.character_profile;
+      memSaveState(state);
+      renderMemoryMaint();
+    }
+    function memDelSummary(tableId, id) {
+      const state = memState();
+      if (!state) return;
+      const arr = Array.isArray(state.records?.[tableId]) ? state.records[tableId] : [];
+      state.records[tableId] = arr.filter(r => String(r.id) !== String(id));
+      if (state.activeRecordIds) delete state.activeRecordIds[tableId];
+      memSaveState(state);
+      renderMemoryMaint();
+    }
+    function renderMemoryMaint() {
+      const el = $('pc-memory-maint'); if (!el) return;
+      const state = memState();
+      if (!state) { el.textContent = '原记忆引擎未就绪，无法读取维护数据。'; return; }
+      const sg = memStorage();
+      const exposed = {
+        chars: !!memCharGraph()?.getCharacterRecords,
+        edit: !!sg?.saveState && !!sg?.loadState,
+        del: !!sg?.saveState && !!sg?.loadState,
+        summary: !!(state.records?.memory_summary || state.records?.plot_summary),
+      };
+      let html = '<div class="pc-hint">维护能力接通情况：人物列表/编辑/删除=' + (exposed.chars && exposed.edit ? '✔' : '✘')
+        + '；小总结列表/删除=' + (exposed.summary && exposed.del ? '✔' : '✘') + '</div>';
+
+      // 人物列表
+      const chars = memCharRecords(state);
+      html += '<div class="pc-hint" style="margin-top:8px"><b>人物档案</b>（' + chars.length + '）</div>';
+      if (chars.length) {
+        html += chars.map(rec => {
+          const name = escHtml(rec.values?.角色名 || rec.id);
+          const brief = escHtml([rec.values?.身份, rec.values?.性格].filter(Boolean).join(' · ') || '');
+          return `<div class="pc-char-row"><b>${name}</b><span>${brief}</span>
+            <button data-mem-edit="${escHtml(rec.id)}">编辑</button><button data-mem-del="${escHtml(rec.id)}">删除</button></div>`;
+        }).join('');
+      } else {
+        html += '<div class="pc-hint">暂无人物档案。</div>';
+      }
+
+      // 小总结 / 记忆条目
+      const SUM_TABLES = [['memory_summary', '记忆总结'], ['plot_summary', '剧情摘要']];
+      SUM_TABLES.forEach(([tid, label]) => {
+        const arr = Array.isArray(state.records?.[tid]) ? state.records[tid] : [];
+        html += '<div class="pc-hint" style="margin-top:8px"><b>' + label + '</b>（' + arr.length + '）</div>';
+        if (arr.length) {
+          html += arr.map(rec => {
+            const title = escHtml(rec.values?.总结标题 || rec.values?.主线 || rec.id);
+            const content = escHtml(String(rec.values?.总结内容 || '').slice(0, 60) || '');
+            return `<div class="pc-char-row"><b>${title}</b><span>${content}</span><button data-mem-sumdel="${escHtml(tid)}" data-mem-sumid="${escHtml(rec.id)}">删除</button></div>`;
+          }).join('');
+        } else {
+          html += '<div class="pc-hint">暂无。</div>';
+        }
+      });
+
+      html += '<div class="pc-hint" style="margin-top:8px;opacity:.7">注：编辑/删除直接经原引擎 Storage.saveState 持久化；未暴露的能力已跳过，不做假按钮。</div>';
+      el.innerHTML = html;
+
+      el.querySelectorAll('[data-mem-edit]').forEach(b => b.onclick = () => memEditChar(b.dataset.memEdit));
+      el.querySelectorAll('[data-mem-del]').forEach(b => b.onclick = () => memDelChar(b.dataset.memDel));
+      el.querySelectorAll('[data-mem-sumdel]').forEach(b => {
+        b.onclick = () => memDelSummary(b.dataset.memSumdel, b.dataset.memSumid);
+      });
+    }
+    $('pc-memory-maint-refresh').onclick = renderMemoryMaint;
 
 
     // BIO 操作
