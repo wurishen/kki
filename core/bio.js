@@ -76,7 +76,7 @@
     logMax: 80
   });
 
-  let fab, panel, drag, busy = false, lastLog = '', view = 'home', viewChar = '';
+  let busy = false, lastLog = '';
   let cachedModels = [];
   let currentChatKey = 'global';
 
@@ -199,12 +199,9 @@
     if (key === '__home__') {
       snapshot = emptySnap();
     }
-    view = 'home';
-    viewChar = '';
     lastLog = '';
     const label = key === '__home__' ? '主界面' : (key === 'global' ? '默认' : key.slice(0, 32));
     addLog('system', '已切换聊天存档：' + label);
-    if (panel) render();
     return true;
   }
 
@@ -1535,8 +1532,7 @@
       if (!names.length) {
         addLog('system', '手动提交失败：当前没有常驻角色');
         lastLog = '无角色可提交';
-        if (panel) render();
-        return;
+            return;
       }
       lines.push('当前无达到关注及以上的需求；周期等信息见上。若仅有平稳状态，大脑无需特别处理。');
       for (const name of names) {
@@ -1566,8 +1562,6 @@
     for (const l of lines) addLog('signal', l);
     lastLog = ok ? ('已提交 ' + lines.length + ' 条') : ('已提交(缓存) ' + lines.length + ' 条');
     // 切到日志页方便立刻看到
-    view = 'log';
-    if (panel) render();
   }
 
   // ==================== 主读取流程 ====================
@@ -1576,7 +1570,6 @@
     if (busy) return;
     busy = true;
     lastLog = manual ? '正在读取并总结最近 10 层…' : '自动读取中…';
-    if (panel) render();
     try {
       const story = collectRecentStory(FLOORS);
       if (!story || story.length < 20) throw new Error('可用正文不足');
@@ -1615,8 +1608,7 @@
       lastLog = (manual ? '失败: ' : '自动失败: ') + msg;
     } finally {
       busy = false;
-      if (panel) render();
-    }
+      }
   }
 
   // ==================== 事件绑定 ====================
@@ -1631,10 +1623,10 @@
     };
 
     on(ev.CHAT_CHANGED || 'CHAT_CHANGED', () => {
-      try { ensureChatScope(); if (panel) render(); } catch (_) {}
+      try { ensureChatScope(); } catch (_) {}
     });
     on(ev.CHAT_ID_CHANGED || 'CHAT_ID_CHANGED', () => {
-      try { ensureChatScope(); if (panel) render(); } catch (_) {}
+      try { ensureChatScope(); } catch (_) {}
     });
 
     // 生成前把当前信号注入
@@ -1680,584 +1672,6 @@
     });
     return true;
   }
-
-  // ==================== UI ====================
-  // 面板始终贴在悬浮按钮上方，不遮挡按钮；拖动按钮时面板跟随
-  function placeFab(left, top) {
-    if (!fab) return;
-    const w = fab.offsetWidth || 56, h = fab.offsetHeight || 32;
-    const x = Math.min(innerWidth - w - 4, Math.max(4, left));
-    const y = Math.min(innerHeight - h - 4, Math.max(4, top));
-    fab.style.left = x + 'px';
-    fab.style.top = y + 'px';
-    fab.style.right = 'auto';
-    fab.style.bottom = 'auto';
-    cfg.fabLeft = x;
-    cfg.fabTop = y;
-    saveCfg();
-    // 面板打开时跟随按钮移动
-    if (panel) positionPanelNearFab();
-  }
-
-  function positionPanelNearFab() {
-    if (!panel || !fab) return;
-    const fr = fab.getBoundingClientRect();
-    const pw = panel.offsetWidth || 168;
-    const ph = Math.min(panel.offsetHeight || 200, innerHeight * 0.52);
-    const gap = 0; // 贴边，无空隙
-
-    // 优先贴在按钮上方（下边沿对齐按钮上边沿）；上方不够则贴下方
-    let top = fr.top - ph - gap;
-    if (top < 8) top = fr.bottom + gap;
-
-    // 水平：与按钮右对齐，形成连续边线
-    let left = fr.right - pw;
-    if (left < 8) left = 8;
-    if (left + pw > innerWidth - 8) left = innerWidth - pw - 8;
-
-    // 垂直最终钳制
-    if (top + ph > innerHeight - 8) top = Math.max(8, innerHeight - ph - 8);
-    if (top < 8) top = 8;
-
-    panel.style.left = left + 'px';
-    panel.style.top = top + 'px';
-    panel.style.right = 'auto';
-    panel.style.bottom = 'auto';
-  }
-
-  function clampPanel() {
-    positionPanelNearFab();
-  }
-
-  function bindDrag(el) {
-    const down = (ev) => {
-      const t = ev.touches ? ev.touches[0] : ev;
-      const r = el.getBoundingClientRect();
-      drag = { dx: t.clientX - r.left, dy: t.clientY - r.top, moved: false };
-      el.classList.add('rpe-dragging');
-      ev.preventDefault();
-    };
-    const move = (ev) => {
-      if (!drag) return;
-      const t = ev.touches ? ev.touches[0] : ev;
-      const left = t.clientX - drag.dx;
-      const top = t.clientY - drag.dy;
-      if (Math.abs(left - (cfg.fabLeft || 0)) > 3 || Math.abs(top - (cfg.fabTop || 0)) > 3) drag.moved = true;
-      placeFab(left, top); // 内部会同步移动面板
-      ev.preventDefault();
-    };
-    const up = () => {
-      if (!drag) return;
-      const m = drag.moved;
-      drag = null;
-      el.classList.remove('rpe-dragging');
-      if (!m) togglePanel();
-    };
-    el.addEventListener('mousedown', down);
-    el.addEventListener('touchstart', down, { passive: false });
-    addEventListener('mousemove', move, { passive: false });
-    addEventListener('touchmove', move, { passive: false });
-    addEventListener('mouseup', up);
-    addEventListener('touchend', up);
-  }
-
-  function mountFab() {
-    // 已收编进 Pyramid Core：不再挂独立 BIO 悬浮球。
-    if (fab) return;
-  }
-
-  function togglePanel() {
-    // 已收编进 Pyramid Core：不打开旧 BIO 面板。
-  }
-
-  function unmountPanel() {
-    if (panel) try { panel.remove(); } catch (_) {}
-    panel = null;
-    // 保留 view / viewChar，下次打开回到关闭前的页面
-  }
-
-  function mountPanel() {
-    // 已收编进 Pyramid Core：BIO 的查看/提交/日志全部在 Core 主面板内完成，不再弹独立窗。
-    if (panel) return;
-    return;
-  }
-
-  function head(title, back) {
-    const b = back
-      ? `<button type="button" class="icon-btn" data-nav="${back}">‹</button>`
-      : `<button type="button" class="icon-btn" data-nav="menu">⚙</button>`;
-    return `<div class="head">${b}<div class="title">${title}</div><button type="button" class="icon-btn" data-act="close">×</button></div>`;
-  }
-
-  function esc(s) {
-    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  }
-
-  function listChars() {
-    return Object.keys(snapshot.characters).filter(k => {
-      const ch = snapshot.characters[k];
-      // 常驻：一旦建档就保留，直到用户主动删除
-      return ch && !ch.removed && shouldTrackCharacter(k, ch.sex) && ch.sex !== 'male';
-    });
-  }
-
-  function deleteChar(name) {
-    if (!name || !snapshot.characters[name]) return;
-    delete snapshot.characters[name];
-    // 清掉该角色相关上报历史
-    if (snapshot.reportHistory) {
-      for (const k of Object.keys(snapshot.reportHistory)) {
-        if (k.startsWith(name + '|')) delete snapshot.reportHistory[k];
-      }
-    }
-    saveSnap();
-    addLog('system', '已移除常驻：' + name);
-    if (viewChar === name) viewChar = '';
-    view = 'home';
-    render();
-  }
-
-  function bindSwipeRows() {
-    panel.querySelectorAll('.swipe-row').forEach(row => {
-      const content = row.querySelector('.swipe-content');
-      const delBtn = row.querySelector('.swipe-del');
-      if (!content || !delBtn) return;
-      let startX = 0, startY = 0, curX = 0, dragging = false, open = false, moved = false;
-
-      // 强制实色，避免点按时变透明露出删除
-      content.style.background = '#0a121e';
-      content.style.opacity = '1';
-
-      const setX = (x) => {
-        curX = Math.max(-72, Math.min(0, x));
-        content.style.transform = 'translateX(' + curX + 'px)';
-      };
-      const close = () => { open = false; moved = false; setX(0); };
-      const openDel = () => { open = true; setX(-72); };
-
-      const onStart = (ev) => {
-        const t = ev.touches ? ev.touches[0] : ev;
-        startX = t.clientX;
-        startY = t.clientY;
-        dragging = true;
-        moved = false;
-        content.style.transition = 'none';
-        content.style.background = '#0a121e';
-        content.style.opacity = '1';
-        panel.querySelectorAll('.swipe-row').forEach(r => {
-          if (r !== row) {
-            const c = r.querySelector('.swipe-content');
-            if (c) { c.style.transition = 'transform 0.18s'; c.style.transform = 'translateX(0)'; }
-          }
-        });
-      };
-      const onMove = (ev) => {
-        if (!dragging) return;
-        const t = ev.touches ? ev.touches[0] : ev;
-        const dx = t.clientX - startX;
-        const dy = t.clientY - startY;
-        // 垂直滑动为主则放弃，避免误触
-        if (!moved && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 8) {
-          dragging = false;
-          close();
-          return;
-        }
-        if (Math.abs(dx) > 6) moved = true;
-        if (open) setX(-72 + dx);
-        else setX(Math.min(0, dx));
-        if (moved) ev.preventDefault();
-      };
-      const onEnd = () => {
-        if (!dragging && !moved) return;
-        dragging = false;
-        content.style.transition = 'transform 0.18s ease';
-        content.style.background = '#0a121e';
-        content.style.opacity = '1';
-        if (moved && curX < -36) openDel();
-        else close();
-      };
-
-      content.addEventListener('touchstart', onStart, { passive: true });
-      content.addEventListener('touchmove', onMove, { passive: false });
-      content.addEventListener('touchend', onEnd);
-      content.addEventListener('mousedown', onStart);
-      addEventListener('mousemove', onMove);
-      addEventListener('mouseup', onEnd);
-
-      content.addEventListener('click', (ev) => {
-        if (open || moved || curX < -8) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          close();
-          return;
-        }
-        const name = row.getAttribute('data-char');
-        viewChar = name;
-        view = 'char';
-        render();
-      });
-
-      delBtn.addEventListener('click', (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const name = row.getAttribute('data-char');
-        deleteChar(name);
-      });
-    });
-  }
-
-  function render() {
-    if (!panel) return;
-
-    if (view === 'home') {
-      const list = listChars();
-      let body;
-      if (!list.length) {
-        body = `<div class="empty">常驻女性角色会自动收录。<br>左滑可删除。<br>配置 API 后点「读取正文」。</div>
-          <div class="btns"><button type="button" class="btn" data-act="read" ${busy ? 'disabled' : ''}>读取正文</button></div>`;
-      } else {
-        body = `<div class="char-list">${list.map(n => {
-          const ch = snapshot.characters[n];
-          let tag = '';
-          if (ch.pregnancy?.active) tag = '孕';
-          else if (ch.menstrual_cycle?.phase === '月经期') tag = '经';
-          else if (ch.present === false) tag = '离场';
-          return `<div class="swipe-row" data-char="${esc(n)}">
-            <button type="button" class="swipe-del">删除</button>
-            <div class="swipe-content char-item"><span>${esc(n)}</span><span class="hint">${tag ? tag + ' ' : ''}›</span></div>
-          </div>`;
-        }).join('')}</div>
-        <div class="btns">
-          <button type="button" class="btn ghost" data-act="read" ${busy ? 'disabled' : ''}>重新读取</button>
-          <button type="button" class="btn ghost" data-act="submit">提交状态</button>
-          <button type="button" class="btn ghost" data-nav="log">日志</button>
-        </div>`;
-      }
-      panel.innerHTML = head('BIO SENSOR') + body + `<div class="log">${esc(lastLog || '')}</div>`;
-      bindSwipeRows();
-    } else if (view === 'char') {
-      const name = viewChar;
-      const ch = snapshot.characters[name];
-      if (!ch?.updatedFromChat) {
-        panel.innerHTML = head(esc(name), 'home') + `<div class="empty">无数据</div>`;
-      } else {
-        const cards = cfg.enabledNeeds.map(k => {
-          const n = ch.needs[k];
-          if (!n) return '';
-          const st = n.stage || '—';
-          const el = k === 'sleep' && n.sleeping ? '睡眠中' : fmtElapsed(n.awake_for != null ? n.awake_for : n.elapsed);
-          const barCls = stageRank(st) >= 3 ? 'bar-bad' : (stageRank(st) >= 2 ? 'bar-warn' : (stageRank(st) >= 1 ? 'bar-warn' : 'bar-ok'));
-          return `<div class="need-card med-row">
-            <span class="med-bar ${barCls}"></span>
-            <div class="med-main">
-              <div class="med-top"><span class="nm">${LABEL[k]}</span><span class="st ${stageClass(st)}">${st}</span></div>
-              <div class="med-sub">距上次</div>
-            </div>
-            <div class="med-wave" aria-hidden="true"></div>
-            <div class="big">${el}</div>
-          </div>`;
-        }).join('');
-
-        let extra = '';
-        if (cfg.trackReproductive) {
-          // 生殖状态动态标签：怀孕优先，否则周期，另可附带受孕窗
-          if (ch.pregnancy?.active) {
-            const days = ch.pregnancy.gestation_days != null ? (Math.round(ch.pregnancy.gestation_days * 10) / 10) + '天' : '';
-            const conf = ch.pregnancy.confirmation && ch.pregnancy.confirmation !== '已确认' ? ' · ' + ch.pregnancy.confirmation : '';
-            extra += `<div class="need-card med-row"><span class="med-bar bar-warn"></span><div class="med-main"><div class="med-top"><span class="nm">生殖</span><span class="st ${stageClass(ch.pregnancy.phase)}">${esc(ch.pregnancy.phase)}</span></div></div><div class="big">${esc(days)}${esc(conf)}</div></div>`;
-          } else if (ch.menstrual_cycle && (ch.menstrual_cycle.active || (ch.menstrual_cycle.phase && ch.menstrual_cycle.phase !== '周期未知'))) {
-            const day = ch.menstrual_cycle.cycle_day != null ? 'D' + ch.menstrual_cycle.cycle_day : '';
-            const dayNum = ch.menstrual_cycle.cycle_day != null ? +ch.menstrual_cycle.cycle_day : 0;
-            const pct = dayNum ? Math.min(100, Math.round(dayNum / 28 * 100)) : 0;
-            extra += `<div class="cycle-strip">
-              <div class="cycle-left"><div class="nm">周期 · <span class="${stageClass(ch.menstrual_cycle.phase)}">${esc(ch.menstrual_cycle.phase)}</span></div><div class="med-sub">${day ? '第 ' + day.slice(1) + ' 天' : ''}</div></div>
-              <div class="cycle-ring" style="--p:${pct}"><span>${esc(day || '—')}</span></div>
-            </div>`;
-            if (ch.menstrual_cycle.prepared && /月经期|易孕期/.test(ch.menstrual_cycle.phase || '')) {
-              extra += `<div class="need-card"><span class="nm">准备</span><span class="sep">·</span><span class="st rpe-ok">已可准备</span></div>`;
-            }
-          }
-          if (!ch.pregnancy?.active && ch.conception?.outcome && ch.conception.outcome !== '无') {
-            const risk = ch.conception.combined_risk_percent != null ? ch.conception.combined_risk_percent + '%' : '';
-            extra += `<div class="need-card"><span class="nm">受孕</span><span class="sep">·</span><span class="st ${stageClass(ch.conception.outcome)}">${esc(ch.conception.outcome)}</span><span class="big">${esc(risk)}</span></div>`;
-          }
-          if (ch.present === false) {
-            extra += `<div class="need-card"><span class="nm">在场</span><span class="sep">·</span><span class="st rpe-warn">离场</span><span class="ago">时间仍推进</span></div>`;
-          }
-        }
-
-        const tl = timelineLabel();
-        const title = `<span class="name-text">${esc(name)}</span>${tl ? `<span class="head-time">${esc(tl)}</span>` : ''}`;
-        panel.innerHTML = head(title, 'home') +
-          `<div class="need-grid med-grid">${cards}</div>` +
-          (extra ? `<div class="extra-block">${extra}</div>` : '');
-      }
-    } else if (view === 'log') {
-      const lines = (logs || []).slice().reverse().slice(0, 40).map(l => {
-        const cls = l.type === 'error' ? 'rpe-bad' : (l.type === 'report' || l.type === 'signal' ? 'rpe-warn' : (l.type === 'quiet' ? 'rpe-ok' : ''));
-        return `<div class="log-line"><span class="t">${esc(l.time)}</span> <span class="${cls}">[${esc(l.type)}]</span> ${esc(l.msg)}</div>`;
-      }).join('');
-      panel.innerHTML = head('运行日志', 'home') +
-        `<div class="log-box">${lines || '<div class="empty">暂无日志</div>'}</div>
-         <div class="btns"><button type="button" class="btn ghost" data-act="clear-log">清空日志</button></div>`;
-    } else if (view === 'menu') {
-      panel.innerHTML = head('设置', 'home') + `<div class="menu">
-        <button type="button" data-nav="needs">观察项与阈值 <span>›</span></button>
-        <button type="button" data-nav="api">独立 API <span>›</span></button>
-        <button type="button" data-nav="log">运行日志 <span>›</span></button>
-        <button type="button" data-act="read">立即读取正文</button>
-        <button type="button" data-act="submit">主动提交当前状态</button>
-        <button type="button" data-act="reset">清空全部状态</button>
-      </div><div class="log">${esc(lastLog || '')}</div>`;
-    } else if (view === 'needs') {
-      panel.innerHTML = head('观察项与阈值', 'menu') + `<div class="tog-list">${
-        NEED_KEYS.map(k => `<label class="tog-row"><span>${LABEL[k]}</span><input type="checkbox" data-need="${k}" ${cfg.enabledNeeds.includes(k) ? 'checked' : ''}></label>`).join('')
-      }
-        <label class="tog-row"><span>经期 / 受孕 / 孕期</span><input type="checkbox" data-f="trackReproductive" ${cfg.trackReproductive ? 'checked' : ''}></label>
-        <label class="tog-row"><span>离场仍推进时间</span><input type="checkbox" data-f="offscreenAdvance" ${cfg.offscreenAdvance ? 'checked' : ''}></label>
-        <label class="tog-row"><span>写入主创提示词</span><input type="checkbox" data-f="injectEnabled" ${cfg.injectEnabled ? 'checked' : ''}></label>
-        <label class="tog-row"><span>防脱钩约束</span><input type="checkbox" data-f="hardSync" ${cfg.hardSync ? 'checked' : ''}></label>
-      </div>
-      <div class="field" style="margin-top:6px">
-        <span style="font-size:10px;color:#9a9aac">上报最低阶段</span>
-        <select data-k="reportMinStage" style="width:100%;margin-top:2px;padding:5px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.3);color:#eee;font-size:11px">
-          <option value="关注" ${cfg.reportMinStage === '关注' ? 'selected' : ''}>关注（较敏感）</option>
-          <option value="迫切" ${cfg.reportMinStage === '迫切' || !cfg.reportMinStage ? 'selected' : ''}>迫切（推荐）</option>
-          <option value="应急" ${cfg.reportMinStage === '应急' ? 'selected' : ''}>应急（很少打扰）</option>
-        </select>
-      </div>
-      <div class="btns"><button type="button" class="btn" data-act="save-needs">保存</button></div>`;
-    } else if (view === 'api') {
-      const modelOptions = cachedModels.length
-        ? cachedModels.map(id => `<option value="${esc(id)}" ${cfg.model === id ? 'selected' : ''}>${esc(id)}</option>`).join('')
-        : `<option value="${esc(cfg.model)}">${esc(cfg.model || '拉取列表')}</option>`;
-      panel.innerHTML = head('独立 API', 'menu') + `
-        <label class="field">Base URL<input type="text" data-k="baseUrl" value="${esc(cfg.baseUrl)}"></label>
-        <label class="field">API Key<input type="password" data-k="apiKey" value="${esc(cfg.apiKey)}"></label>
-        <label class="field">模型<select class="rpe-model-select" data-k="model">${modelOptions}</select></label>
-        <label class="field">手动模型名<input type="text" data-k="modelManual" value="" placeholder="可选"></label>
-        <label class="field">自动读取间隔（轮）<input type="text" data-k="autoEvery" value="${esc(cfg.autoEvery)}"></label>
-        <div class="tog-list">
-          <label class="tog-row"><span>禁令层</span><input type="checkbox" data-f="rulesEnabled" ${cfg.rulesEnabled !== false ? 'checked' : ''}></label>
-          <label class="field">禁令扫描间隔（轮）<input type="text" data-k="rulesEvery" value="${esc(cfg.rulesEvery != null ? cfg.rulesEvery : 2)}"></label>
-          <div class="field" style="font-size:11px;opacity:.85">禁令经验库：<span data-learned-count>0</span> 条</div>
-          <div class="btns">
-            <button type="button" class="btn ghost" data-act="export-learned">导出经验库</button>
-            <button type="button" class="btn ghost" data-act="import-learned">导入经验库</button>
-            <button type="button" class="btn ghost" data-act="clear-learned">清空</button>
-          </div>
-          <input type="file" accept="application/json,.json" data-act="import-learned-file" style="display:none" />
-          <label class="tog-row"><span>独立 API</span><input type="checkbox" data-f="sideApiEnabled" ${cfg.sideApiEnabled ? 'checked' : ''}></label>
-        </div>
-        <div class="btns">
-          <button type="button" class="btn ghost" data-act="fetch-models">拉取模型</button>
-          <button type="button" class="btn" data-act="save-api">保存</button>
-        </div>
-        <div class="log">${esc(lastLog || '')}</div>`;
-    }
-
-    bindChrome();
-    requestAnimationFrame(clampPanel);
-  }
-
-  function bindChrome() {
-    if (!panel) return;
-    panel.querySelectorAll('[data-act=close]').forEach(b => { b.onclick = unmountPanel; });
-    panel.querySelectorAll('[data-nav]').forEach(b => {
-      b.onclick = () => { view = b.getAttribute('data-nav'); render(); };
-    });
-    panel.querySelectorAll('[data-act=read]').forEach(b => { b.onclick = () => readFromChat(true); });
-    panel.querySelectorAll('[data-act=submit]').forEach(b => {
-      b.onclick = () => {
-        try { forceSubmitCurrentState(); }
-        catch (e) {
-          addLog('error', '手动提交异常: ' + (e && e.message ? e.message : e));
-          lastLog = '提交失败';
-          view = 'log';
-          if (panel) render();
-        }
-      };
-    });
-
-    const reset = panel.querySelector('[data-act=reset]');
-    if (reset) {
-      reset.onclick = () => {
-        if (!confirm('确认清空全部生理状态？')) return;
-        snapshot = emptySnap();
-        saveSnap();
-        addLog('system', '状态已清空');
-        lastLog = '已清空';
-        view = 'home';
-        render();
-      };
-    }
-
-    const clearLog = panel.querySelector('[data-act=clear-log]');
-    if (clearLog) {
-      clearLog.onclick = () => {
-        logs = [];
-        saveLogs();
-        lastLog = '日志已清空';
-        render();
-      };
-    }
-
-    const learnedEl = panel.querySelector('[data-learned-count]');
-    if (learnedEl) {
-      try { learnedEl.textContent = String(loadLearnedRules().length); } catch (_) { learnedEl.textContent = '0'; }
-    }
-    const clearLearned = panel.querySelector('[data-act=clear-learned]');
-    if (clearLearned) {
-      clearLearned.onclick = () => {
-        try { localStorage.removeItem(LEARNED_KEY); } catch (_) {}
-        lastLog = '禁令经验库已清空';
-        addLog('rules', '禁令经验库已清空');
-        render();
-      };
-    }
-    const exportLearned = panel.querySelector('[data-act=export-learned]');
-    if (exportLearned) {
-      exportLearned.onclick = () => {
-        try {
-          const list = loadLearnedRules();
-          const payload = JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), items: list }, null, 2);
-          const blob = new Blob([payload], { type: 'application/json' });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = 'rpe-rule-memory-' + new Date().toISOString().slice(0, 10) + '.json';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(function() { try { URL.revokeObjectURL(a.href); a.remove(); } catch (_) {} }, 800);
-          lastLog = '已导出禁令经验库 ' + list.length + ' 条';
-          addLog('rules', lastLog);
-        } catch (e) {
-          addLog('error', '导出失败: ' + (e && e.message ? e.message : e));
-        }
-      };
-    }
-    const importBtn = panel.querySelector('[data-act=import-learned]');
-    const importFile = panel.querySelector('[data-act=import-learned-file]');
-    if (importBtn && importFile) {
-      importBtn.onclick = function() { importFile.click(); };
-      importFile.onchange = async function() {
-        const f = importFile.files && importFile.files[0];
-        importFile.value = '';
-        if (!f) return;
-        try {
-          const text = await f.text();
-          const data = JSON.parse(text);
-          const incoming = Array.isArray(data) ? data : (Array.isArray(data.items) ? data.items : []);
-          if (!incoming.length) throw new Error('文件里没有条目');
-          let list = loadLearnedRules();
-          const map = new Map();
-          for (const x of list) {
-            const s = x.sig || ((Array.isArray(x.ids) ? x.ids.join(',') : '') + '|' + (x.reason || ''));
-            map.set(s, x);
-          }
-          let added = 0;
-          for (const it of incoming) {
-            if (!it || typeof it !== 'object') continue;
-            const sig = it.sig || ((Array.isArray(it.ids) ? it.ids.join(',') : '') + '|' + (it.reason || ''));
-            if (!sig || sig === '|') continue;
-            if (map.has(sig)) {
-              const old = map.get(sig);
-              old.count = Math.max(old.count || 1, it.count || 1);
-              if ((it.at || 0) > (old.at || 0)) {
-                old.excerpt = it.excerpt || old.excerpt;
-                old.at = it.at;
-                old.reason = it.reason || old.reason;
-                old.ids = it.ids || old.ids;
-              }
-            } else {
-              map.set(sig, {
-                sig: sig,
-                ids: Array.isArray(it.ids) ? it.ids : [],
-                reason: String(it.reason || ''),
-                excerpt: String(it.excerpt || ''),
-                count: it.count || 1,
-                at: it.at || Date.now()
-              });
-              added++;
-            }
-          }
-          list = Array.from(map.values());
-          list.sort(function(a, b) { return (b.count || 0) - (a.count || 0) || (b.at || 0) - (a.at || 0); });
-          saveLearnedRules(list);
-          lastLog = '已导入禁令经验库 +' + added + ' 新条，合计 ' + list.length;
-          addLog('rules', lastLog);
-          render();
-        } catch (e) {
-          addLog('error', '导入失败: ' + (e && e.message ? e.message : e));
-        }
-      };
-    }
-
-    const sn = panel.querySelector('[data-act=save-needs]');
-    if (sn) {
-      sn.onclick = () => {
-        cfg.enabledNeeds = NEED_KEYS.filter(k => panel.querySelector(`[data-need="${k}"]`)?.checked);
-        panel.querySelectorAll('[data-f]').forEach(el => {
-          cfg[el.getAttribute('data-f')] = !!el.checked;
-        });
-        const sel = panel.querySelector('[data-k=reportMinStage]');
-        if (sel) cfg.reportMinStage = sel.value;
-        saveCfg();
-        addLog('system', '观察项与阈值已保存');
-        lastLog = '已保存';
-        view = 'menu';
-        render();
-      };
-    }
-
-    const sa = panel.querySelector('[data-act=save-api]');
-    if (sa) {
-      sa.onclick = () => {
-        panel.querySelectorAll('[data-k]').forEach(el => {
-          const k = el.getAttribute('data-k');
-          if (k === 'modelManual') return;
-          cfg[k] = (k === 'autoEvery' || k === 'rulesEvery') ? (parseInt(el.value, 10) || (k === 'rulesEvery' ? 2 : 3)) : el.value;
-        });
-        const manual = panel.querySelector('[data-k=modelManual]')?.value?.trim();
-        if (manual) cfg.model = manual;
-        panel.querySelectorAll('[data-f]').forEach(el => {
-          cfg[el.getAttribute('data-f')] = !!el.checked;
-        });
-        saveCfg();
-        addLog('system', 'API 设置已保存');
-        lastLog = 'API 已保存';
-        render();
-      };
-    }
-
-    const fm = panel.querySelector('[data-act=fetch-models]');
-    if (fm) {
-      fm.onclick = async () => {
-        panel.querySelectorAll('[data-k]').forEach(el => {
-          const k = el.getAttribute('data-k');
-          if (k === 'model' || k === 'modelManual') return;
-          if (k === 'autoEvery') cfg[k] = parseInt(el.value, 10) || 3;
-          if (k === 'rulesEvery') cfg[k] = parseInt(el.value, 10) || 2;
-          else if (k) cfg[k] = el.value;
-        });
-        saveCfg();
-        lastLog = '拉取中…';
-        render();
-        try {
-          const ids = await fetchModelList();
-          if (cfg.model && !ids.includes(cfg.model)) ids.unshift(cfg.model);
-          cachedModels = ids;
-          lastLog = '已拉取 ' + ids.length + ' 个模型';
-          addLog('system', lastLog);
-        } catch (e) {
-          lastLog = '拉取失败: ' + (e.message || e);
-          addLog('error', lastLog);
-        }
-        view = 'api';
-        render();
-      };
-    }
-  }
-
   function boot() {
     currentChatKey = getChatKey();
     snapshot = load('snap', emptySnap, true);
@@ -2274,7 +1688,6 @@
     }
     if (!Object.keys(snapshot.characters).length) snapshot.primed = false;
 
-    mountFab();
     let tries = 0;
     const t = setInterval(() => {
       ensureChatScope();
@@ -2282,7 +1695,6 @@
     }, 500);
     // 定期检查是否换聊天（兼容无事件的前端）
     setInterval(() => { try { ensureChatScope(); } catch (_) {} }, 2000);
-    addEventListener('resize', () => { if (panel) clampPanel(); });
     addLog('system', 'v0.6.49 已启动（禁令侧脑勾选）');
     console.info('[RPE] v0.6.49 rule side-api select');
 

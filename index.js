@@ -83,7 +83,7 @@
 
   try {
     // BIO is a classic IIFE; load it first so its signal injector is available.
-    await loadClassic('engines/bio/index.js');
+    await loadClassic('core/bio.js');
     window.PyramidCore.engines.bio = { loaded: true };
   } catch (e) { console.error('[PyramidCore] BIO boot failed', e); window.PyramidCore.engines.bio = { loaded: false, error: e.message }; }
 
