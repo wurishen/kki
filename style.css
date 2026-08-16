@@ -16478,7 +16478,9 @@ select.ni-modal-input {
 .pc-bio-pane .pc-check input{width:auto;margin:0}
 /* 设置/API 页限高一半，靠上下滑动浏览 */
 .pc-bio-pane[data-bv-pane="settings"],
-.pc-bio-pane[data-bv-pane="api"]{
+.pc-bio-pane[data-bv-pane="api"],
+.pc-bio-pane[data-nv-pane="inj"],
+.pc-bio-pane[data-nv-pane="stage"]{
   max-height:26vh;
   overflow:auto;
   padding-right:4px;
