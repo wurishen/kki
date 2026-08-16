@@ -202,11 +202,10 @@
 
         <div class="pc-pane" data-pane="status">
           <div class="pc-grid">
-            <div><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
+            <div id="pc-bio-box" class="pc-bio-box"><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
             <div><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
             <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
-          <button id="pc-bio-enter">🧬 进入 BIO 模块</button>
           <div class="pc-row">
             <button id="pc-open-novel">打开 Novel</button>
             <button id="pc-open-memory">打开 Memory</button>
@@ -305,6 +304,10 @@
             <label class="pc-field">Base URL<input type="text" data-bapi="baseUrl"></label>
             <label class="pc-field">API Key<input type="password" data-bapi="apiKey"></label>
             <label class="pc-field">模型<input type="text" data-bapi="model"></label>
+            <div class="pc-row">
+              <button id="pc-bio-fetch-models">拉取模型</button>
+              <select id="pc-bio-model-list" style="display:none"></select>
+            </div>
             <label class="pc-field">手动模型名（可选）<input type="text" data-bapi="modelManual"></label>
             <label class="pc-check"><input type="checkbox" data-bf="sideApiEnabled"> 启用独立 API</label>
             <label class="pc-check"><input type="checkbox" data-bf="rulesEnabled"> 禁令层</label>
@@ -401,7 +404,7 @@
       if (bv === 'api') loadBioApi();
     }
     wrap.querySelectorAll('.pc-bio-tab').forEach(b => b.onclick = () => switchBioView(b.dataset.bv));
-    $('pc-bio-enter').onclick = enterBio;
+    $('pc-bio-box').onclick = enterBio;
     $('pc-bio-back').onclick = exitBio;
     $('pc-bio-refresh2').onclick = () => { renderBioStatusFull(); $('pc-bio-result').textContent = 'BIO 状态已刷新。'; };
 
@@ -496,6 +499,28 @@
       const re = wrap.querySelector('[data-bnum=rulesEvery]'); if (re) cfg.rulesEvery = parseInt(re.value, 10) || 2;
       window.PyramidBio?.saveConfig?.();
       $('pc-bio-result').textContent = 'API 设置已保存。';
+    };
+    $('pc-bio-fetch-models').onclick = async () => {
+      const cfg = bioCfg(); const out = $('pc-bio-result');
+      if (!cfg || !window.PyramidBio?.fetchModels) { out.textContent = 'BIO 引擎未就绪。'; return; }
+      cfg.baseUrl = wrap.querySelector('[data-bapi=baseUrl]')?.value || '';
+      cfg.apiKey = wrap.querySelector('[data-bapi=apiKey]')?.value || '';
+      window.PyramidBio?.saveConfig?.();
+      const sel = $('pc-bio-model-list');
+      try {
+        const ids = await window.PyramidBio.fetchModels();
+        if (!Array.isArray(ids) || !ids.length) throw new Error('列表为空');
+        sel.innerHTML = ids.map(m => `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('');
+        sel.style.display = '';
+        out.textContent = '已拉取 ' + ids.length + ' 个模型，从下拉选择后点「保存 API 设置」。';
+      } catch (e) {
+        sel.style.display = 'none';
+        out.textContent = '拉取失败：' + (e.message || e);
+      }
+    };
+    $('pc-bio-model-list').onchange = () => {
+      const v = $('pc-bio-model-list').value;
+      const m = wrap.querySelector('[data-bapi=model]'); if (m) m.value = v;
     };
     $('pc-bio-export-learned').onclick = () => {
       const list = window.PyramidBio?.getLearnedRules?.() || [];
