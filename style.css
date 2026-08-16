@@ -16476,6 +16476,17 @@ select.ni-modal-input {
 .pc-field input,.pc-field select{width:100%;margin-top:3px;padding:5px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#eee;font-size:11px;box-sizing:border-box}
 .pc-bio-pane .pc-check{display:flex;align-items:center;gap:6px;margin:5px 0;font-size:11px}
 .pc-bio-pane .pc-check input{width:auto;margin:0}
+/* 设置/API 页限高一半，靠上下滑动浏览 */
+.pc-bio-pane[data-bv-pane="settings"],
+.pc-bio-pane[data-bv-pane="api"]{
+  max-height:26vh;
+  overflow:auto;
+  padding-right:4px;
+}
+.pc-bio-pane .pc-field{margin:3px 0}
+.pc-bio-pane .pc-check{margin:2px 0}
+.pc-bio-pane .pc-field input,.pc-bio-pane .pc-field select{padding:3px 6px;margin-top:2px}
+.pc-body .pc-bio-pane button{margin:3px;padding:6px}
 .pc-grid .pc-bio-box{cursor:pointer;transition:background .15s}
 .pc-grid .pc-bio-box:hover{background:#35354a;border-color:#7a7ad0}
 #pc-bio-events{max-height:130px;min-height:84px;overflow:auto}
