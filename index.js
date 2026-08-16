@@ -3,7 +3,6 @@
  * Single-extension integration layer.
  * The original engines are bundled as internal modules:
  *   - BIO / rpe-physio-monitor
- *   - Novel Injector
  *   - yuzuki-Memory
  * This file provides one bootstrap, one UI, one event bus and a unified
  * cognitive-pack bridge without deleting the original engines' storage namespaces.
@@ -70,14 +69,12 @@
       return {
         // BIO 以注册表/引擎 API 为准；旧写法读的是注入后才存在、清理后即空的临时值，会误报“未检测到”
         bio: !!(window.PyramidBio?.loaded || this.engines.bio?.api),
-        novel: !!(window.niGetDebugLogs || window._niS),
         memory: !!window.YuzukiMemory?.loaded,
       };
     },
     storageKeys: {
       bio: 'rpe_physio_monitor_v06',
       memory: 'YuzukiMemory',
-      novel: 'novel_injector',
     }
   };
 
@@ -97,16 +94,6 @@
       raw: window.YuzukiMemory,
     });
   } catch (e) { console.error('[PyramidCore] Memory boot failed', e); window.PyramidCore.engines.memory = { loaded: false, error: e.message }; }
-
-  try {
-    await importModule('engines/novel/index.js');
-    window.PyramidCore.engines.novel = { loaded: true };
-    window.PyramidCore.registerEngine('novel', {
-      loaded: true,
-      getLogs: () => window.niGetDebugLogs?.() ?? window.__NI_DEBUG_LOGS__ ?? [],
-      raw: () => window._niS,
-    });
-  } catch (e) { console.error('[PyramidCore] Novel boot failed', e); window.PyramidCore.engines.novel = { loaded: false, error: e.message }; }
 
   // Unified event hooks. Child engines keep their own storage/logic; Core owns the shared lifecycle.
   const emitFloor = () => {
@@ -171,7 +158,7 @@
   window.PyramidCore.compileCognitivePack = compileCognitivePack;
 
   // 唯一入口：隐藏子引擎各自的悬浮球，统一由 Core 面板转入
-  const CHILD_FABS = ['rpe-fab', 'ni-fab', 'ni-fab-ring', 'yzm-memory-floating-button'];
+  const CHILD_FABS = ['rpe-fab', 'yzm-memory-floating-button'];
   function hideChildFabs() {
     if (!state.singleEntry) return;
     for (const id of CHILD_FABS) {
@@ -203,7 +190,6 @@
         <div class="pc-pane" data-pane="status">
           <div class="pc-grid">
             <div id="pc-bio-box" class="pc-bio-box"><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
-            <div id="pc-novel-box" class="pc-bio-box"><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
             <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
           <div class="pc-row">
@@ -321,39 +307,6 @@
             <button id="pc-bio-save-api">保存 API 设置</button>
           </div>
         </div>
-
-        <div class="pc-pane" data-pane="novel" hidden>
-          <div class="pc-bio-bar">
-            <button id="pc-novel-back">← 返回主界面</button>
-            <span>📚 Novel 模块</span>
-          </div>
-          <div class="pc-tabs pc-bio-tabs">
-            <button class="pc-bio-tab pc-on" data-nv="status">状态</button>
-            <button class="pc-bio-tab" data-nv="inj">注入</button>
-            <button class="pc-bio-tab" data-nv="stage">阶段</button>
-            <button class="pc-bio-tab" data-nv="log">日志</button>
-          </div>
-
-          <div class="pc-bio-pane" data-nv-pane="status">
-            <div id="pc-novel-status"></div>
-            <div class="pc-row"><button id="pc-novel-adv">高级（旧面板）</button></div>
-          </div>
-
-          <div class="pc-bio-pane" data-nv-pane="inj" hidden>
-            <div id="pc-novel-inj"></div>
-            <div class="pc-row"><button id="pc-novel-save-inj">保存注入设置</button></div>
-          </div>
-
-          <div class="pc-bio-pane" data-nv-pane="stage" hidden>
-            <div id="pc-novel-stages"></div>
-            <div class="pc-row"><button id="pc-novel-stage-on">全部开启</button><button id="pc-novel-stage-off">全部关闭</button></div>
-          </div>
-
-          <div class="pc-bio-pane" data-nv-pane="log" hidden>
-            <div class="pc-row"><button id="pc-novel-clear-log">清空日志</button></div>
-            <pre id="pc-novel-events"></pre>
-          </div>
-        </div>
       </div>`;
     document.body.appendChild(wrap);
 
@@ -405,7 +358,7 @@
 
     const set = () => {
       const s = window.PyramidCore.getStatus();
-      for (const [id,key] of [['pc-bio','bio'],['pc-novel','novel'],['pc-memory','memory']]) {
+      for (const [id,key] of [['pc-bio','bio'],['pc-memory','memory']]) {
         const el = $(id); if (el) el.textContent = s[key] ? '已接入' : '未检测到';
       }
       renderBioStatus();
@@ -417,12 +370,9 @@
       wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== name; });
       if (name === 'log') renderEvents();
       if (name === 'bio') renderBioStatusFull();
-      if (name === 'novel') renderNovelStatus();
     }
     function enterBio() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('bio'); }
     function exitBio() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
-    function enterNovel() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('novel'); }
-    function exitNovel() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
     wrap.querySelectorAll('.pc-tab').forEach(btn => btn.onclick = () => {
       if (bioActive) exitBio();
       wrap.querySelectorAll('.pc-tab').forEach(b => b.classList.toggle('pc-on', b === btn));
@@ -443,104 +393,6 @@
     $('pc-bio-back').onclick = exitBio;
     $('pc-bio-refresh2').onclick = () => { renderBioStatusFull(); $('pc-bio-result').textContent = 'BIO 状态已刷新。'; };
 
-    // Novel 第二层分页
-    const niCfg = () => window.extension_settings?.['novel-injector'] || {};
-    const niOn = () => niCfg().pluginEnabled !== false;
-    function renderNovelStatus() {
-      const el = $('pc-novel-status'); if (!el) return;
-      const cfg = niCfg();
-      const name = cfg._autoSaveSourceName || '';
-      const stageCount = Object.keys(cfg._stageStates || {}).length;
-      const cnt = (window.niGetDebugLogs?.() || []).length;
-      const logs = window.niGetDebugLogs?.() || [];
-      const last = logs[logs.length - 1];
-      const rows = [
-        `<div class="pc-field">注入开关：<b>${niOn() ? '已启用' : '已停用'}</b></div>`,
-        `<div class="pc-field">当前小说：<b>${name ? escHtml(name) : '—'}</b></div>`,
-        `<div class="pc-field">阶段数量：<b>${stageCount}</b>${stageCount ? '' : '（暂无阶段数据）'}</div>`,
-        `<div class="pc-field">调试日志：<b>${cnt}</b> 条</div>`,
-      ];
-      if (last) rows.push(`<div class="pc-field">最近日志：<span class="${last.level === 'error' ? 'pc-s-emerg' : (last.level === 'warn' ? 'pc-s-watch' : 'pc-s-ok')}">[${escHtml(last.t)} ${escHtml(last.level)}] ${escHtml(last.message)}</span></div>`);
-      el.innerHTML = rows.join('');
-    }
-    // 注入设置：绑定原引擎真实配置项
-    const NI_INJ_SPEC = [
-      { k: 'pluginEnabled', type: 'bool', label: '启用注入' },
-      { k: 'vecInjDisabled', type: 'bool', label: '禁用向量注入' },
-      { k: 'charAutoSleepEnabled', type: 'bool', label: '阶段角色人设自动休眠' },
-      { k: 'devAutoUpdateEnabled', type: 'bool', label: '偏差自动更新' },
-      { k: 'userSubEnabled', type: 'bool', label: '用户代玩' },
-      { k: 'autoSaveEnabled', type: 'bool', label: '自动保存快照' },
-      { k: 'rawInjMode', type: 'sel', label: '原文注入模式', opts: [['nodes','剧情节点'], ['compressed','压缩原文']] },
-      { k: 'recallTopK', type: 'num', label: '向量召回条数' },
-    ];
-    function renderNovelInj() {
-      const el = $('pc-novel-inj'); if (!el) return;
-      const cfg = niCfg();
-      el.innerHTML = NI_INJ_SPEC.map(it => {
-        if (it.type === 'bool') return `<label class="pc-check"><input type="checkbox" data-nik="${it.k}" ${cfg[it.k] !== false ? 'checked' : ''}> ${it.label}</label>`;
-        if (it.type === 'sel') return `<label class="pc-field">${it.label}<select data-nik="${it.k}">${it.opts.map(([v,l]) => `<option value="${v}" ${String(cfg[it.k]) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
-        return `<label class="pc-field">${it.label}<input type="number" min="1" data-nik="${it.k}" value="${cfg[it.k] ?? 3}"></label>`;
-      }).join('');
-    }
-    function saveNovelInj() {
-      const cfg = niCfg();
-      wrap.querySelectorAll('[data-nik]').forEach(el => {
-        const k = el.dataset.nik;
-        if (el.type === 'checkbox') cfg[k] = el.checked;
-        else if (el.tagName === 'SELECT') cfg[k] = el.value;
-        else cfg[k] = parseInt(el.value, 10) || cfg[k];
-      });
-      if (typeof window.niSaveSettings === 'function') window.niSaveSettings();
-    }
-    // 阶段列表与开关（调用原引擎方法）
-    function renderNovelStages() {
-      const el = $('pc-novel-stages'); if (!el) return;
-      const cfg = niCfg();
-      const states = cfg._stageStates || {};
-      const titles = cfg._stageTitles || {};
-      const keys = Object.keys(states).sort((a, b) => a - b);
-      if (!keys.length) { el.innerHTML = '<div class="pc-field">暂无阶段数据（先上传/清洗小说后会出现）。</div>'; return; }
-      el.innerHTML = keys.map(i => {
-        const on = states[i] !== false;
-        return `<div class="pc-bio-card"><div class="pc-bio-head"><b>阶段 ${i}</b><span class="pc-bio-repro">${escHtml(titles[i] || '')}</span></div>
-          <label class="pc-check"><input type="checkbox" data-nstage="${i}" ${on ? 'checked' : ''}> 参与注入</label></div>`;
-      }).join('');
-    }
-    function switchNovelView(nv) {
-      wrap.querySelectorAll('[data-nv]').forEach(b => b.classList.toggle('pc-on', b.dataset.nv === nv));
-      wrap.querySelectorAll('[data-nv-pane]').forEach(p => { p.hidden = p.dataset.nvPane !== nv; });
-      if (nv === 'status') renderNovelStatus();
-      if (nv === 'inj') renderNovelInj();
-      if (nv === 'stage') renderNovelStages();
-      if (nv === 'log') renderNovelEvents();
-    }
-    function renderNovelEvents() {
-      const el = $('pc-novel-events'); if (!el) return;
-      const rows = (window.niGetDebugLogs?.() || []).slice().reverse().slice(0, 60).map(l =>
-        `[${l.t}] ${l.level}  ${l.message}${l.detail ? '\n' + String(l.detail) : ''}`);
-      el.textContent = rows.length ? rows.join('\n') : '暂无日志（触发一次异常/警告后会写到这里）。';
-    }
-    wrap.querySelectorAll('[data-nv]').forEach(b => b.onclick = () => switchNovelView(b.dataset.nv));
-    $('pc-novel-box').onclick = enterNovel;
-    $('pc-novel-back').onclick = exitNovel;
-    $('pc-novel-adv').onclick = () => { try { window.niTogglePanel?.(); } catch (_) {} };
-    $('pc-novel-save-inj').onclick = () => { saveNovelInj(); renderNovelInj(); renderNovelStatus(); };
-    $('pc-novel-stages').addEventListener('change', (e) => {
-      const t = e.target; if (!t.dataset?.nstage) return;
-      const i = parseInt(t.dataset.nstage, 10);
-      if (typeof window.niToggleStage !== 'function') return;
-      try {
-        const cur = niCfg()._stageStates?.[i] !== false;
-        if (cur === !!t.checked) return;
-        const res = window.niToggleStage(i);
-        if (typeof res === 'boolean') t.checked = res;
-      } catch (_) {}
-      setTimeout(renderNovelStages, 60);
-    });
-    $('pc-novel-stage-on').onclick = () => { try { window.niSetAllStagesEnabled?.(true); } catch (_) {} setTimeout(renderNovelStages, 60); };
-    $('pc-novel-stage-off').onclick = () => { try { window.niSetAllStagesEnabled?.(false); } catch (_) {} setTimeout(renderNovelStages, 60); };
-    $('pc-novel-clear-log').onclick = () => { window.niClearDebugLogs?.(); renderNovelEvents(); renderNovelStatus(); };
 
     // BIO 操作
     $('pc-bio-read2').onclick = async () => {

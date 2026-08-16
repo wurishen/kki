@@ -3,7 +3,7 @@
   "id": "pyramid_core_unified",
   "display_name": "🔺 Pyramid Core · 金字塔认知一体化",
   "version": "0.3.0",
-  "description": "将 BIO 生理监测、Novel Injector 小说上下文、柚月 Memory 记忆系统与统一认知协调层整合为一个扩展。",
+  "description": "将 BIO 生理监测、柚月 Memory 记忆系统与统一认知协调层整合为一个扩展，专注人类行为模拟（身体/记忆）。",
   "author": "Pyramid Core integration",
   "auto_update": false,
   "requires": [],
