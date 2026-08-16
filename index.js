@@ -207,9 +207,13 @@
             <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
           <div class="pc-row">
-            <button id="pc-open-bio">打开 BIO 面板</button>
+            <button id="pc-refresh-bio">🔄 刷新 BIO 状态</button>
             <button id="pc-open-novel">打开 Novel</button>
             <button id="pc-open-memory">打开 Memory</button>
+          </div>
+          <div class="pc-bio-block">
+            <div class="pc-hint">🧬 BIO 生理状态（内嵌，无需另开旧面板）</div>
+            <div id="pc-bio-status"></div>
           </div>
           <label class="pc-check"><input type="checkbox" id="pc-single" checked> 唯一入口（隐藏子引擎悬浮球）</label>
           <button id="pc-export">导出 Core 状态</button>
@@ -238,11 +242,55 @@
     document.body.appendChild(wrap);
 
     const $ = (id) => document.getElementById(id);
+    const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    // 内嵌 BIO 生理状态：直接读引擎快照/配置，在主面板内页渲染，不再依赖旧悬浮窗
+    const BIO_NEED_LABEL = { drink:'饮水', meal:'进食', urination:'排尿', bowel_movement:'排便', sleep:'睡眠' };
+    const BIO_STAGE = ['平稳', '关注', '迫切', '应急'];
+    const bioRank = (s) => { const i = BIO_STAGE.indexOf(String(s || '')); return i < 0 ? 0 : i; };
+    const bioCls = (s) => { const r = bioRank(s); return r >= 3 ? 'pc-s-emerg' : (r >= 2 ? 'pc-s-urgent' : (r >= 1 ? 'pc-s-watch' : 'pc-s-ok')); };
+    function renderBioStatus() {
+      const el = $('pc-bio-status'); if (!el) return;
+      const api = window.PyramidBio;
+      if (!api?.getSnapshot) { el.innerHTML = '<div class="pc-hint">BIO 引擎未就绪，无法显示状态。</div>'; return; }
+      const snap = api.getSnapshot() || {};
+      const cfg = api.getConfig?.() || {};
+      const chars = Object.entries(snap.characters || {}).filter(([,c]) => c);
+      if (!chars.length) {
+        el.innerHTML = '<div class="pc-hint">暂无已跟踪角色。在「信号」页点「立即总结近文并判断」后会收录。</div>';
+        return;
+      }
+      const needs = Array.isArray(cfg.enabledNeeds) && cfg.enabledNeeds.length ? cfg.enabledNeeds : Object.keys(BIO_NEED_LABEL);
+      el.innerHTML = chars.map(([name, ch]) => {
+        let tag = '';
+        if (ch.pregnancy?.active) tag = '孕';
+        else if (ch.menstrual_cycle?.phase === '月经期') tag = '经';
+        else if (ch.present === false) tag = '离场';
+        const chips = needs.map(k => {
+          const n = ch.needs?.[k]; if (!n) return '';
+          const st = n.stage || '平稳';
+          return `<span class="pc-bio-tag ${bioCls(st)}">${escHtml(BIO_NEED_LABEL[k] || k)}·${escHtml(st)}</span>`;
+        }).join('');
+        let repro = '';
+        if (cfg.trackReproductive) {
+          if (ch.pregnancy?.active) repro = '孕期 · ' + escHtml(ch.pregnancy.phase || '');
+          else if (ch.menstrual_cycle?.phase && ch.menstrual_cycle.phase !== '周期未知')
+            repro = '周期 · ' + escHtml(ch.menstrual_cycle.phase) + (ch.menstrual_cycle.cycle_day != null ? ' D' + ch.menstrual_cycle.cycle_day : '');
+          else if (ch.conception?.outcome && ch.conception.outcome !== '无') repro = '受孕 · ' + escHtml(ch.conception.outcome);
+        }
+        return `<div class="pc-bio-card">
+          <div class="pc-bio-head"><b>${escHtml(name)}</b>${tag ? `<span class="pc-bio-tag pc-s-watch">${tag}</span>` : ''}<span class="pc-bio-repro">${repro}</span></div>
+          <div class="pc-bio-needs">${chips || '<span class="pc-hint">无观察项</span>'}</div>
+        </div>`;
+      }).join('');
+    }
+
     const set = () => {
       const s = window.PyramidCore.getStatus();
       for (const [id,key] of [['pc-bio','bio'],['pc-novel','novel'],['pc-memory','memory']]) {
         const el = $(id); if (el) el.textContent = s[key] ? '已接入' : '未检测到';
       }
+      renderBioStatus();
     };
 
     // 分页
@@ -294,7 +342,7 @@
       catch (e) { $('pc-log').textContent = '总结失败：' + e.message; }
       renderEvents();
     };
-    $('pc-open-bio').onclick = () => window.PyramidBio?.openPanel?.() || ($('pc-log').textContent = 'BIO 面板不可用。');
+    $('pc-refresh-bio').onclick = () => { renderBioStatus(); $('pc-log').textContent = 'BIO 状态已刷新（内嵌，不再打开旧面板）。'; };
     $('pc-open-novel').onclick = () => {
       const el = document.getElementById('ni-fab');
       if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }

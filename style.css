@@ -16447,3 +16447,14 @@ select.ni-modal-input {
 .pc-check input{width:auto;margin:0}
 .pc-hint{font-size:11px;opacity:.6;margin:2px 0 8px;line-height:1.5}
 #pc-events{min-height:60px}
+.pc-bio-block{margin:6px 0}
+.pc-bio-card{border:1px solid #4a4a55;border-radius:8px;padding:7px;margin-bottom:6px;background:#22222a}
+.pc-bio-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px}
+.pc-bio-head b{font-size:12px}
+.pc-bio-repro{font-size:10px;opacity:.65;flex:1;text-align:right}
+.pc-bio-needs{display:flex;gap:5px;flex-wrap:wrap}
+.pc-bio-tag{font-size:10px;padding:2px 6px;border-radius:10px;border:1px solid transparent}
+.pc-s-ok{background:rgba(80,180,120,.18);color:#7fd6a4;border-color:rgba(80,180,120,.4)}
+.pc-s-watch{background:rgba(230,180,70,.16);color:#e8c06a;border-color:rgba(230,180,70,.4)}
+.pc-s-urgent{background:rgba(235,130,70,.18);color:#f0a26a;border-color:rgba(235,130,70,.45)}
+.pc-s-emerg{background:rgba(230,80,80,.2);color:#f08a8a;border-color:rgba(230,80,80,.5)}
