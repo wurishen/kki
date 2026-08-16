@@ -219,6 +219,8 @@
     logs.push({ time, type, msg: String(msg || '') });
     saveLogs();
     lastLog = msg;
+    // 上交给统一 Core（Core 缺席时静默降级，BIO 仍可独立工作）
+    try { window.PyramidCore?.pushEvent?.('bio-log', { type, msg: String(msg || ''), time }); } catch (_) {}
   }
 
   function getCtx() {
@@ -1417,6 +1419,8 @@
     const val = text || '';
     lastInjectText = val;
     window.__RPE_STATE_INJECT__ = val;
+    // 器官 → Core：短信号上交，由 Core 汇总本轮认知包
+    try { window.PyramidCore?.reportBioSignal?.(val, { source: 'injectState' }); } catch (_) {}
     let ok = false;
 
     const trySet = (fn) => { try { fn(); return true; } catch (_) { return false; } };
@@ -1474,6 +1478,8 @@
       if (typeof ctx.saveChat === 'function') ctx.saveChat();
       bioInjectPending = false;
       addLog('system', '本轮生成结束，已移除临时 BIO 信号消息');
+      // 阅后即焚：同步通知 Core 清掉本轮信号
+      try { window.PyramidCore?.clearBioSignal?.(); } catch (_) {}
     } catch (e) {
       addLog('error', '清理 BIO 消息失败: ' + (e && e.message ? e.message : e));
     }
@@ -2292,6 +2298,24 @@
     addEventListener('resize', () => { if (panel) clampPanel(); });
     addLog('system', 'v0.6.49 已启动（禁令侧脑勾选）');
     console.info('[RPE] v0.6.49 rule side-api select');
+
+    // 向统一 Core 注册：只暴露稳定接口，内部实现与存储命名空间不变
+    try {
+      window.PyramidBio = {
+        loaded: true,
+        version: '0.6.49',
+        forceSubmit: () => forceSubmitCurrentState(),
+        readFromChat: (manual) => readFromChat(manual !== false),
+        getSnapshot: () => snapshot,
+        getConfig: () => cfg,
+        getLogs: () => logs.slice(-200),
+        getLastSignal: () => lastInjectText || '',
+        openPanel: () => { if (!panel) mountPanel(); },
+        togglePanel: () => togglePanel(),
+        setFabVisible: (v) => { if (fab) fab.style.display = v ? '' : 'none'; },
+      };
+      window.PyramidCore?.registerEngine?.('bio', window.PyramidBio);
+    } catch (e) { console.warn('[RPE] Core 注册失败', e); }
   }
 
   if (document.readyState === 'loading') {

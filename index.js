@@ -17,6 +17,8 @@
     events: [],
     lastPack: '',
     enabled: true,
+    singleEntry: true,   // 唯一入口：隐藏子引擎悬浮球
+    bioSignal: '',       // 本轮短信号，生成结束即清
   };
   const listeners = new Map();
   const on = (name, fn) => { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); return () => listeners.get(name)?.delete(fn); };
@@ -42,10 +44,33 @@
     emit,
     pushEvent,
     engines: {},
+    // 器官上交的短信号（本轮有效，阅后即焚）
+    bioSignal: '',
+    registerEngine(name, api) {
+      this.engines[name] = Object.assign(this.engines[name] || {}, { loaded: true, api });
+      pushEvent('engine-registered', { name });
+      try { window.PyramidCore.refreshUI?.(); } catch (_) {}
+      return true;
+    },
+    reportBioSignal(text, meta = {}) {
+      const val = typeof text === 'string' ? text : (text == null ? '' : JSON.stringify(text));
+      state.bioSignal = val;
+      this.bioSignal = val;
+      pushEvent(val ? 'bio-signal' : 'bio-signal-cleared', { text: val, ...meta });
+      try { window.PyramidCore.refreshUI?.(); } catch (_) {}
+      return val;
+    },
+    clearBioSignal() {
+      state.bioSignal = '';
+      this.bioSignal = '';
+      pushEvent('bio-signal-cleared', {});
+      try { window.PyramidCore.refreshUI?.(); } catch (_) {}
+    },
     getStatus() {
       return {
-        bio: !!window.__RPE_STATE_INJECT__,
-        novel: !!window.niGetDebugLogs,
+        // BIO 以注册表/引擎 API 为准；旧写法读的是注入后才存在、清理后即空的临时值，会误报“未检测到”
+        bio: !!(window.PyramidBio?.loaded || this.engines.bio?.api),
+        novel: !!(window.niGetDebugLogs || window._niS),
         memory: !!window.YuzukiMemory?.loaded,
       };
     },
@@ -65,11 +90,22 @@
   try {
     await importModule('engines/yuzuki/index.js');
     window.PyramidCore.engines.memory = { loaded: !!window.YuzukiMemory?.loaded };
+    // 记忆引擎经 Core 汇合：保留其自身注入路径，仅登记接口供统一 UI/认知包取用
+    if (window.YuzukiMemory) window.PyramidCore.registerEngine('memory', {
+      loaded: true,
+      openPanel: () => window.YuzukiMemory?.MemoryWindow?.open?.() ?? window.YuzukiMemory?.MemoryWindow?.toggle?.(),
+      raw: window.YuzukiMemory,
+    });
   } catch (e) { console.error('[PyramidCore] Memory boot failed', e); window.PyramidCore.engines.memory = { loaded: false, error: e.message }; }
 
   try {
     await importModule('engines/novel/index.js');
     window.PyramidCore.engines.novel = { loaded: true };
+    window.PyramidCore.registerEngine('novel', {
+      loaded: true,
+      getLogs: () => window.niGetDebugLogs?.() ?? window.__NI_DEBUG_LOGS__ ?? [],
+      raw: () => window._niS,
+    });
   } catch (e) { console.error('[PyramidCore] Novel boot failed', e); window.PyramidCore.engines.novel = { loaded: false, error: e.message }; }
 
   // Unified event hooks. Child engines keep their own storage/logic; Core owns the shared lifecycle.
@@ -108,6 +144,10 @@
   }
   function getBioSignal() {
     try {
+      // 优先用 Core 汇合到的短信号；回落到引擎 API，最后才读旧全局
+      if (state.bioSignal) return state.bioSignal;
+      const viaApi = window.PyramidBio?.getLastSignal?.();
+      if (viaApi) return viaApi;
       const raw = window.__RPE_STATE_INJECT__;
       if (raw == null) return '';
       return typeof raw === 'string' ? raw : JSON.stringify(raw);
@@ -130,27 +170,157 @@
   }
   window.PyramidCore.compileCognitivePack = compileCognitivePack;
 
+  // 唯一入口：隐藏子引擎各自的悬浮球，统一由 Core 面板转入
+  const CHILD_FABS = ['rpe-fab', 'ni-fab', 'ni-fab-ring', 'yzm-memory-floating-button'];
+  function hideChildFabs() {
+    if (!state.singleEntry) return;
+    for (const id of CHILD_FABS) {
+      const el = document.getElementById(id);
+      if (el && el.dataset.pcHidden !== '1') { el.dataset.pcHidden = '1'; el.style.display = 'none'; }
+    }
+  }
+  function showChildFabs() {
+    for (const id of CHILD_FABS) {
+      const el = document.getElementById(id);
+      if (el) { el.dataset.pcHidden = '0'; el.style.display = ''; }
+    }
+  }
+  // 子引擎的球是异步挂载的，持续收敛一段时间
+  const fabSweep = setInterval(hideChildFabs, 1000);
+  setTimeout(() => clearInterval(fabSweep), 60000);
+
   function mountUI() {
     if (document.getElementById('pyramid-core-panel')) return;
     const wrap = document.createElement('div'); wrap.id = 'pyramid-core-panel'; wrap.className = 'pyramid-core-panel'; wrap.innerHTML = `
       <div class="pc-head"><b>🔺 Pyramid Core</b><span>Unified v${VERSION}</span><button id="pc-close">×</button></div>
       <div class="pc-body">
-        <div class="pc-grid">
-          <div><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
-          <div><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
-          <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
+        <div class="pc-tabs">
+          <button class="pc-tab pc-on" data-tab="status">状态</button>
+          <button class="pc-tab" data-tab="signal">信号</button>
+          <button class="pc-tab" data-tab="log">日志</button>
         </div>
-        <button id="pc-pack">生成当前认知包</button>
-        <button id="pc-export">导出 Core 状态</button>
-        <pre id="pc-log"></pre>
+
+        <div class="pc-pane" data-pane="status">
+          <div class="pc-grid">
+            <div><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
+            <div><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
+            <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
+          </div>
+          <div class="pc-row">
+            <button id="pc-open-bio">打开 BIO 面板</button>
+            <button id="pc-open-novel">打开 Novel</button>
+            <button id="pc-open-memory">打开 Memory</button>
+          </div>
+          <label class="pc-check"><input type="checkbox" id="pc-single" checked> 唯一入口（隐藏子引擎悬浮球）</label>
+          <button id="pc-export">导出 Core 状态</button>
+        </div>
+
+        <div class="pc-pane" data-pane="signal" hidden>
+          <div class="pc-hint">身体只上交短信号，是否处理由主脑决定。</div>
+          <button id="pc-bio-submit">手动提交当前 BIO 状态到提示词</button>
+          <button id="pc-bio-read">立即总结近文并判断</button>
+          <button id="pc-pack">生成当前认知包</button>
+          <button id="pc-clear">清除本轮信号（阅后即焚）</button>
+          <pre id="pc-log"></pre>
+        </div>
+
+        <div class="pc-pane" data-pane="log" hidden>
+          <div class="pc-row">
+            <button class="pc-f pc-on" data-f="all">全部</button>
+            <button class="pc-f" data-f="summary">summary</button>
+            <button class="pc-f" data-f="signal">signal</button>
+            <button class="pc-f" data-f="report">report</button>
+            <button class="pc-f" data-f="quiet">quiet</button>
+          </div>
+          <pre id="pc-events"></pre>
+        </div>
       </div>`;
     document.body.appendChild(wrap);
-    const set = () => { const s = window.PyramidCore.getStatus(); for (const [id,key] of [['pc-bio','bio'],['pc-novel','novel'],['pc-memory','memory']]) document.getElementById(id).textContent = s[key] ? '已接入' : '未检测到'; };
-    document.getElementById('pc-close').onclick = () => wrap.classList.remove('open');
-    document.getElementById('pc-pack').onclick = () => { const p = compileCognitivePack(); document.getElementById('pc-log').textContent = p || '当前没有可注入的统一数据。'; };
-    document.getElementById('pc-export').onclick = () => { const blob = new Blob([JSON.stringify({ version: VERSION, state, status: window.PyramidCore.getStatus() }, null, 2)], {type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'pyramid-core-state.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); };
-    set(); window.PyramidCore.openPanel = () => { wrap.classList.add('open'); set(); };
-    const fab = document.createElement('button'); fab.id='pyramid-core-fab'; fab.textContent='🔺'; fab.title='Pyramid Core'; fab.onclick=()=>wrap.classList.toggle('open'); document.body.appendChild(fab);
+
+    const $ = (id) => document.getElementById(id);
+    const set = () => {
+      const s = window.PyramidCore.getStatus();
+      for (const [id,key] of [['pc-bio','bio'],['pc-novel','novel'],['pc-memory','memory']]) {
+        const el = $(id); if (el) el.textContent = s[key] ? '已接入' : '未检测到';
+      }
+    };
+
+    // 分页
+    wrap.querySelectorAll('.pc-tab').forEach(btn => btn.onclick = () => {
+      wrap.querySelectorAll('.pc-tab').forEach(b => b.classList.toggle('pc-on', b === btn));
+      wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== btn.dataset.tab; });
+      if (btn.dataset.tab === 'log') renderEvents();
+    });
+
+    // 日志：来自各引擎经 Core 汇合的事件
+    let logFilter = 'all';
+    function renderEvents() {
+      const el = $('pc-events'); if (!el) return;
+      const rows = state.events.filter(ev => {
+        if (logFilter === 'all') return true;
+        return ev.type === 'bio-log' && ev.data?.type === logFilter;
+      }).slice(-80).map(ev => {
+        const t = (ev.data?.time) || String(ev.at).slice(11,19);
+        const kind = ev.type === 'bio-log' ? ev.data.type : ev.type;
+        const msg = ev.type === 'bio-log' ? ev.data.msg : JSON.stringify(ev.data).slice(0,180);
+        return `[${t}] ${kind}  ${msg}`;
+      });
+      el.textContent = rows.length ? rows.join('\n') : '暂无记录（产生总结/信号后会出现在这里）。';
+    }
+    wrap.querySelectorAll('.pc-f').forEach(b => b.onclick = () => {
+      logFilter = b.dataset.f;
+      wrap.querySelectorAll('.pc-f').forEach(x => x.classList.toggle('pc-on', x === b));
+      renderEvents();
+    });
+
+    $('pc-close').onclick = () => wrap.classList.remove('open');
+    $('pc-pack').onclick = () => { const p = compileCognitivePack(); $('pc-log').textContent = p || '当前没有可注入的统一数据。'; };
+    $('pc-clear').onclick = () => { window.PyramidCore.clearBioSignal(); $('pc-log').textContent = '已清除本轮 BIO 信号。'; };
+    $('pc-bio-submit').onclick = () => {
+      const api = window.PyramidBio;
+      if (!api?.forceSubmit) { $('pc-log').textContent = 'BIO 引擎未就绪，无法提交。'; return; }
+      try {
+        api.forceSubmit();
+        const sig = window.PyramidCore.bioSignal || api.getLastSignal?.() || '';
+        $('pc-log').textContent = sig ? '已提交，本轮提示词中的信号：\n\n' + sig : '已提交，但当前没有达到阈值的信号（无信号不主动演三急）。';
+      } catch (e) { $('pc-log').textContent = '提交失败：' + e.message; }
+      renderEvents();
+    };
+    $('pc-bio-read').onclick = async () => {
+      const api = window.PyramidBio;
+      if (!api?.readFromChat) { $('pc-log').textContent = 'BIO 引擎未就绪。'; return; }
+      $('pc-log').textContent = '正在总结近文…（先总结再判断，不会无总结乱报）';
+      try { await api.readFromChat(true); $('pc-log').textContent = '总结完成，详见「日志」分页。'; }
+      catch (e) { $('pc-log').textContent = '总结失败：' + e.message; }
+      renderEvents();
+    };
+    $('pc-open-bio').onclick = () => window.PyramidBio?.openPanel?.() || ($('pc-log').textContent = 'BIO 面板不可用。');
+    $('pc-open-novel').onclick = () => {
+      const el = document.getElementById('ni-fab');
+      if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }
+      else $('pc-log').textContent = 'Novel 入口未找到。';
+    };
+    $('pc-open-memory').onclick = () => {
+      const api = window.YuzukiMemory?.MemoryWindow;
+      if (api?.open) api.open();
+      else if (api?.toggle) api.toggle();
+      else {
+        const el = document.getElementById('yzm-memory-floating-button');
+        if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }
+        else $('pc-log').textContent = 'Memory 入口未找到。';
+      }
+    };
+    $('pc-single').onchange = (e) => {
+      state.singleEntry = !!e.target.checked;
+      if (state.singleEntry) hideChildFabs(); else showChildFabs();
+    };
+    $('pc-export').onclick = () => { const blob = new Blob([JSON.stringify({ version: VERSION, state, status: window.PyramidCore.getStatus() }, null, 2)], {type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'pyramid-core-state.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); };
+
+    set();
+    window.PyramidCore.refreshUI = () => { try { set(); renderEvents(); } catch (_) {} };
+    window.PyramidCore.openPanel = () => { wrap.classList.add('open'); set(); };
+    const fab = document.createElement('button'); fab.id='pyramid-core-fab'; fab.textContent='🔺'; fab.title='Pyramid Core'; fab.onclick=()=>{ wrap.classList.toggle('open'); set(); }; document.body.appendChild(fab);
+    hideChildFabs();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountUI, { once: true }); else mountUI();
   console.log(`[Pyramid Core Unified] v${VERSION} ready`, window.PyramidCore.getStatus());

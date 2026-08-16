@@ -16433,3 +16433,17 @@ select.ni-modal-input {
         max-height: calc(100% - 24px);
     }
 }
+
+/* ===== Pyramid Core 统一入口：分页 / 分组按钮 / 日志过滤 (v0.3.1) ===== */
+.pc-tabs{display:flex;gap:6px;margin-bottom:8px;border-bottom:1px solid #444;padding-bottom:6px}
+.pc-body .pc-tabs button.pc-tab{width:auto;flex:1;margin:0;padding:6px 8px;font-size:12px;background:#22222a;border:1px solid #4a4a55;border-radius:7px;opacity:.7}
+.pc-body .pc-tabs button.pc-tab.pc-on{opacity:1;background:#35354a;border-color:#7a7ad0;color:#fff}
+.pc-pane[hidden]{display:none}
+.pc-row{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0}
+.pc-body .pc-row button{width:auto;flex:1 1 auto;min-width:88px;margin:0;padding:6px 8px;font-size:11px}
+.pc-body .pc-row button.pc-f{flex:0 0 auto;min-width:0;padding:5px 9px;opacity:.6;background:#22222a}
+.pc-body .pc-row button.pc-f.pc-on{opacity:1;background:#35354a;border-color:#7a7ad0}
+.pc-check{display:flex;align-items:center;gap:7px;margin:8px 0;font-size:11px;opacity:.85}
+.pc-check input{width:auto;margin:0}
+.pc-hint{font-size:11px;opacity:.6;margin:2px 0 8px;line-height:1.5}
+#pc-events{min-height:60px}
