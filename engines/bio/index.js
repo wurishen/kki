@@ -1762,19 +1762,12 @@
   }
 
   function mountFab() {
+    // 已收编进 Pyramid Core：不再挂独立 BIO 悬浮球。
     if (fab) return;
-    fab = document.createElement('button');
-    fab.id = 'rpe-fab';
-    fab.type = 'button';
-    fab.textContent = 'BIO';
-    document.body.appendChild(fab);
-    if (cfg.fabLeft != null) placeFab(cfg.fabLeft, cfg.fabTop);
-    bindDrag(fab);
   }
 
   function togglePanel() {
-    if (panel) unmountPanel();
-    else mountPanel();
+    // 已收编进 Pyramid Core：不打开旧 BIO 面板。
   }
 
   function unmountPanel() {
@@ -1784,15 +1777,9 @@
   }
 
   function mountPanel() {
+    // 已收编进 Pyramid Core：BIO 的查看/提交/日志全部在 Core 主面板内完成，不再弹独立窗。
     if (panel) return;
-    // 不再隐藏悬浮按钮：面板开着时按钮仍可见、可拖
-    panel = document.createElement('div');
-    panel.id = 'rpe-panel';
-    document.body.appendChild(panel);
-    render();
-    requestAnimationFrame(() => {
-      positionPanelNearFab();
-    });
+    return;
   }
 
   function head(title, back) {
@@ -2310,9 +2297,10 @@
         getConfig: () => cfg,
         getLogs: () => logs.slice(-200),
         getLastSignal: () => lastInjectText || '',
-        openPanel: () => { if (!panel) mountPanel(); },
-        togglePanel: () => togglePanel(),
-        setFabVisible: (v) => { if (fab) fab.style.display = v ? '' : 'none'; },
+        // 已收编进 Core：不暴露旧窗/悬浮球入口
+        openPanel: () => {},
+        togglePanel: () => {},
+        setFabVisible: () => {},
       };
       window.PyramidCore?.registerEngine?.('bio', window.PyramidBio);
     } catch (e) { console.warn('[RPE] Core 注册失败', e); }
