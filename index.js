@@ -190,10 +190,7 @@
         <div class="pc-pane" data-pane="status">
           <div class="pc-grid">
             <div id="pc-bio-box" class="pc-bio-box"><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
-            <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
-          </div>
-          <div class="pc-row">
-            <button id="pc-open-memory">打开 Memory</button>
+            <div id="pc-memory-box" class="pc-bio-box"><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
           <div class="pc-bio-block">
             <div class="pc-hint">🧬 BIO 生理状态（内嵌，无需另开旧面板）</div>
@@ -307,6 +304,29 @@
             <button id="pc-bio-save-api">保存 API 设置</button>
           </div>
         </div>
+
+        <div class="pc-pane" data-pane="memory" hidden>
+          <div class="pc-bio-bar">
+            <button id="pc-memory-back">← 返回主界面</button>
+            <span>🧠 Memory 模块</span>
+          </div>
+          <div class="pc-tabs pc-bio-tabs">
+            <button class="pc-bio-tab pc-on" data-mv="status">状态</button>
+            <button class="pc-bio-tab" data-mv="log">日志</button>
+          </div>
+
+          <div class="pc-bio-pane" data-mv-pane="status">
+            <div class="pc-row"><button id="pc-memory-refresh">🔄 刷新状态</button></div>
+            <div id="pc-memory-status"></div>
+            <div class="pc-hint">常用操作（来自原引擎，不重写算法）：</div>
+            <button id="pc-memory-open">打开 Memory 面板</button>
+            <button id="pc-memory-clear-log">清空日志</button>
+          </div>
+
+          <div class="pc-bio-pane" data-mv-pane="log" hidden>
+            <pre id="pc-memory-events"></pre>
+          </div>
+        </div>
       </div>`;
     document.body.appendChild(wrap);
 
@@ -370,9 +390,12 @@
       wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== name; });
       if (name === 'log') renderEvents();
       if (name === 'bio') renderBioStatusFull();
+      if (name === 'memory') renderMemoryStatus();
     }
     function enterBio() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('bio'); }
     function exitBio() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
+    function enterMemory() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('memory'); }
+    function exitMemory() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
     wrap.querySelectorAll('.pc-tab').forEach(btn => btn.onclick = () => {
       if (bioActive) exitBio();
       wrap.querySelectorAll('.pc-tab').forEach(b => b.classList.toggle('pc-on', b === btn));
@@ -392,6 +415,48 @@
     $('pc-bio-box').onclick = enterBio;
     $('pc-bio-back').onclick = exitBio;
     $('pc-bio-refresh2').onclick = () => { renderBioStatusFull(); $('pc-bio-result').textContent = 'BIO 状态已刷新。'; };
+
+    // Memory 第二层分页
+    function switchMemoryView(mv) {
+      wrap.querySelectorAll('[data-mv]').forEach(b => b.classList.toggle('pc-on', b.dataset.mv === mv));
+      wrap.querySelectorAll('[data-mv-pane]').forEach(p => { p.hidden = p.dataset.mvPane !== mv; });
+      if (mv === 'status') renderMemoryStatus();
+      if (mv === 'log') renderMemoryEvents();
+    }
+    function renderMemoryStatus() {
+      const el = $('pc-memory-status'); if (!el) return;
+      const api = window.YuzukiMemory;
+      const loaded = !!api?.loaded || !!api;
+      const sum = api?.LogViewer?.getSummary?.() || {};
+      const rows = [
+        `<div class="pc-field">引擎状态：<b>${loaded ? '已接入' : '未检测到'}</b></div>`,
+        `<div class="pc-field">日志：<b>${sum.total ?? 0}</b> 条（info ${sum.info ?? 0} / warn ${sum.warn ?? 0} / error ${sum.error ?? 0}）</div>`,
+      ];
+      el.innerHTML = rows.join('');
+    }
+    function renderMemoryEvents() {
+      const el = $('pc-memory-events'); if (!el) return;
+      const logs = window.YuzukiMemory?.LogViewer?.getLogs?.() || [];
+      const rows = logs.slice(-80).map(l => {
+        const t = new Date(l.timestamp).toTimeString().slice(0,8);
+        return `[${t}] ${l.level}  ${l.message}`;
+      });
+      el.textContent = rows.length ? rows.join('\n') : '暂无日志记录。';
+    }
+    wrap.querySelectorAll('[data-mv]').forEach(b => b.onclick = () => switchMemoryView(b.dataset.mv));
+    $('pc-memory-box').onclick = enterMemory;
+    $('pc-memory-back').onclick = exitMemory;
+    $('pc-memory-refresh').onclick = () => renderMemoryStatus();
+    $('pc-memory-open').onclick = () => {
+      const api = window.YuzukiMemory?.MemoryWindow;
+      if (api?.toggle) api.toggle();
+      else if (api?.open) api.open();
+      else $('pc-memory-status').textContent = 'Memory 入口未找到。';
+    };
+    $('pc-memory-clear-log').onclick = () => {
+      window.YuzukiMemory?.LogViewer?.clearLogs?.();
+      renderMemoryEvents(); renderMemoryStatus();
+    };
 
 
     // BIO 操作
@@ -564,16 +629,6 @@
     });
 
     $('pc-close').onclick = () => wrap.classList.remove('open');
-    $('pc-open-memory').onclick = () => {
-      const api = window.YuzukiMemory?.MemoryWindow;
-      if (api?.open) api.open();
-      else if (api?.toggle) api.toggle();
-      else {
-        const el = document.getElementById('yzm-memory-floating-button');
-        if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }
-        else $('pc-log').textContent = 'Memory 入口未找到。';
-      }
-    };
     $('pc-single').onchange = (e) => {
       state.singleEntry = !!e.target.checked;
       if (state.singleEntry) hideChildFabs(); else showChildFabs();
@@ -581,7 +636,7 @@
     $('pc-export').onclick = () => { const blob = new Blob([JSON.stringify({ version: VERSION, state, status: window.PyramidCore.getStatus() }, null, 2)], {type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'pyramid-core-state.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); };
 
     set();
-    window.PyramidCore.refreshUI = () => { try { set(); renderEvents(); renderBioStatusFull(); } catch (_) {} };
+    window.PyramidCore.refreshUI = () => { try { set(); renderEvents(); renderBioStatusFull(); renderMemoryStatus(); renderMemoryEvents(); } catch (_) {} };
     window.PyramidCore.openPanel = () => { wrap.classList.add('open'); set(); };
     const fab = document.createElement('button'); fab.id='pyramid-core-fab'; fab.textContent='🔺'; fab.title='Pyramid Core'; fab.onclick=()=>{ wrap.classList.toggle('open'); set(); }; document.body.appendChild(fab);
     hideChildFabs();
