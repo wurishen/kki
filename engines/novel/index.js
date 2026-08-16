@@ -3493,6 +3493,15 @@ function niTogglePlugin() {
 }
 window.niTogglePlugin = niTogglePlugin;
 
+// 供 Pyramid Core 第二层无 DOM 依赖地切换插件开关
+window.niSetPluginEnabled = function niSetPluginEnabled(enabled) {
+    const cfg = extension_settings[EXT_NAME] || {};
+    cfg.pluginEnabled = !!enabled;
+    niSyncPluginToggleUI();
+    niSaveSettings();
+    niSyncRoleplayToDepth();
+};
+
 jQuery(async () => {
 
     // ── 动态注入小说库书卡样式─────

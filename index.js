@@ -203,11 +203,10 @@
         <div class="pc-pane" data-pane="status">
           <div class="pc-grid">
             <div id="pc-bio-box" class="pc-bio-box"><b>🧬 BIO</b><span id="pc-bio">检测中</span></div>
-            <div><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
+            <div id="pc-novel-box" class="pc-bio-box"><b>📚 Novel</b><span id="pc-novel">检测中</span></div>
             <div><b>🧠 Memory</b><span id="pc-memory">检测中</span></div>
           </div>
           <div class="pc-row">
-            <button id="pc-open-novel">打开 Novel</button>
             <button id="pc-open-memory">打开 Memory</button>
           </div>
           <div class="pc-bio-block">
@@ -322,6 +321,28 @@
             <button id="pc-bio-save-api">保存 API 设置</button>
           </div>
         </div>
+
+        <div class="pc-pane" data-pane="novel" hidden>
+          <div class="pc-bio-bar">
+            <button id="pc-novel-back">← 返回主界面</button>
+            <span>📚 Novel 模块</span>
+          </div>
+          <div class="pc-tabs pc-bio-tabs">
+            <button class="pc-bio-tab pc-on" data-nv="status">状态</button>
+            <button class="pc-bio-tab" data-nv="log">日志</button>
+          </div>
+
+          <div class="pc-bio-pane" data-nv-pane="status">
+            <label class="pc-check"><input type="checkbox" id="pc-novel-enabled"> 启用注入</label>
+            <div class="pc-field">调试日志 <span id="pc-novel-logcount">0</span> 条</div>
+            <div id="pc-novel-status"></div>
+          </div>
+
+          <div class="pc-bio-pane" data-nv-pane="log" hidden>
+            <div class="pc-row"><button id="pc-novel-clear-log">清空日志</button></div>
+            <pre id="pc-novel-events"></pre>
+          </div>
+        </div>
       </div>`;
     document.body.appendChild(wrap);
 
@@ -385,9 +406,12 @@
       wrap.querySelectorAll('.pc-pane').forEach(p => { p.hidden = p.dataset.pane !== name; });
       if (name === 'log') renderEvents();
       if (name === 'bio') renderBioStatusFull();
+      if (name === 'novel') renderNovelStatus();
     }
     function enterBio() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('bio'); }
     function exitBio() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
+    function enterNovel() { bioActive = true; wrap.classList.add('pc-bio-mode'); showPane('novel'); }
+    function exitNovel() { bioActive = false; wrap.classList.remove('pc-bio-mode'); showPane('status'); }
     wrap.querySelectorAll('.pc-tab').forEach(btn => btn.onclick = () => {
       if (bioActive) exitBio();
       wrap.querySelectorAll('.pc-tab').forEach(b => b.classList.toggle('pc-on', b === btn));
@@ -396,17 +420,57 @@
 
     // BIO 第二层分页
     function switchBioView(bv) {
-      wrap.querySelectorAll('.pc-bio-tab').forEach(b => b.classList.toggle('pc-on', b.dataset.bv === bv));
-      wrap.querySelectorAll('.pc-bio-pane').forEach(p => { p.hidden = p.dataset.bvPane !== bv; });
+      wrap.querySelectorAll('[data-bv]').forEach(b => b.classList.toggle('pc-on', b.dataset.bv === bv));
+      wrap.querySelectorAll('[data-bv-pane]').forEach(p => { p.hidden = p.dataset.bvPane !== bv; });
       if (bv === 'status') renderBioStatusFull();
       if (bv === 'log') renderBioEvents();
       if (bv === 'settings') loadBioSettings();
       if (bv === 'api') loadBioApi();
     }
-    wrap.querySelectorAll('.pc-bio-tab').forEach(b => b.onclick = () => switchBioView(b.dataset.bv));
+    wrap.querySelectorAll('[data-bv]').forEach(b => b.onclick = () => switchBioView(b.dataset.bv));
     $('pc-bio-box').onclick = enterBio;
     $('pc-bio-back').onclick = exitBio;
     $('pc-bio-refresh2').onclick = () => { renderBioStatusFull(); $('pc-bio-result').textContent = 'BIO 状态已刷新。'; };
+
+    // Novel 第二层分页
+    const niCfg = () => window.extension_settings?.['novel-injector'] || {};
+    function renderNovelStatus() {
+      const el = $('pc-novel-status'); if (!el) return;
+      const on = niCfg().pluginEnabled !== false;
+      const chk = $('pc-novel-enabled'); if (chk) chk.checked = on;
+      const cnt = (window.niGetDebugLogs?.() || []).length;
+      const lc = $('pc-novel-logcount'); if (lc) lc.textContent = cnt;
+      const logs = window.niGetDebugLogs?.() || [];
+      const last = logs[logs.length - 1];
+      el.innerHTML = on
+        ? '<div class="pc-field">状态：<b>已启用</b>（小说上下文注入进行中）</div>' + (last ? `<div class="pc-field">最近日志：<span class="${last.level === 'error' ? 'pc-s-emerg' : (last.level === 'warn' ? 'pc-s-watch' : 'pc-s-ok')}">[${escHtml(last.t)} ${escHtml(last.level)}] ${escHtml(last.message)}</span></div>` : '<div class="pc-field">暂无调试日志。</div>')
+        : '<div class="pc-field">状态：<b>已停用</b>（小说上下文注入关闭）</div>';
+    }
+    function switchNovelView(nv) {
+      wrap.querySelectorAll('[data-nv]').forEach(b => b.classList.toggle('pc-on', b.dataset.nv === nv));
+      wrap.querySelectorAll('[data-nv-pane]').forEach(p => { p.hidden = p.dataset.nvPane !== nv; });
+      if (nv === 'status') renderNovelStatus();
+      if (nv === 'log') renderNovelEvents();
+    }
+    function renderNovelEvents() {
+      const el = $('pc-novel-events'); if (!el) return;
+      const rows = (window.niGetDebugLogs?.() || []).slice().reverse().slice(0, 60).map(l =>
+        `[${l.t}] ${l.level}  ${l.message}${l.detail ? '\n' + String(l.detail) : ''}`);
+      el.textContent = rows.length ? rows.join('\n') : '暂无日志（触发一次异常/警告后会写到这里）。';
+    }
+    wrap.querySelectorAll('[data-nv]').forEach(b => b.onclick = () => switchNovelView(b.dataset.nv));
+    $('pc-novel-box').onclick = enterNovel;
+    $('pc-novel-back').onclick = exitNovel;
+    $('pc-novel-enabled').onchange = (e) => {
+      const on = !!e.target.checked;
+      if (typeof window.niSetPluginEnabled === 'function') window.niSetPluginEnabled(on);
+      else {
+        const cfg = niCfg(); cfg.pluginEnabled = on;
+        if (typeof window.niSaveSettings === 'function') window.niSaveSettings();
+      }
+      renderNovelStatus();
+    };
+    $('pc-novel-clear-log').onclick = () => { window.niClearDebugLogs?.(); renderNovelEvents(); renderNovelStatus(); };
 
     // BIO 操作
     $('pc-bio-read2').onclick = async () => {
@@ -578,11 +642,6 @@
     });
 
     $('pc-close').onclick = () => wrap.classList.remove('open');
-    $('pc-open-novel').onclick = () => {
-      const el = document.getElementById('ni-fab');
-      if (el) { el.style.display = ''; el.click(); setTimeout(hideChildFabs, 1500); }
-      else $('pc-log').textContent = 'Novel 入口未找到。';
-    };
     $('pc-open-memory').onclick = () => {
       const api = window.YuzukiMemory?.MemoryWindow;
       if (api?.open) api.open();

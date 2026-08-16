@@ -16489,5 +16489,5 @@ select.ni-modal-input {
 .pc-body .pc-bio-pane button{margin:3px;padding:6px}
 .pc-grid .pc-bio-box{cursor:pointer;transition:background .15s}
 .pc-grid .pc-bio-box:hover{background:#35354a;border-color:#7a7ad0}
-#pc-bio-events{max-height:130px;min-height:84px;overflow:auto}
+#pc-bio-events,#pc-novel-events{max-height:130px;min-height:84px;overflow:auto}
 #pc-bio-model-list{width:auto;flex:0 0 auto;min-width:120px;margin:4px;padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#eee;font-size:11px}
