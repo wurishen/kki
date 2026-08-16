@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "no_signal_no_sanji",
+      "title": "无信号不演三急",
+      "path": "iron/no_signal_no_sanji.md",
+      "tags": [
+        "bio",
+        "iron"
+      ],
+      "keywords": [
+        "尿",
+        "饿",
+        "渴",
+        "困",
+        "厕所",
+        "BIO",
+        "生理"
+      ],
+      "priority": 100,
+      "always_with_bio": true
+    },
+    {
+      "id": "no_qianghua",
+      "title": "禁止抢话",
+      "path": "iron/no_qianghua.md",
+      "tags": [
+        "iron"
+      ],
+      "keywords": [],
+      "priority": 95,
+      "always_with_bio": true
+    },
+    {
+      "id": "no_proactive_nsfw",
+      "title": "禁止主动发情",
+      "path": "iron/no_proactive_nsfw.md",
+      "tags": [
+        "iron",
+        "nsfw"
+      ],
+      "keywords": [
+        "发情",
+        "性爱",
+        "做爱"
+      ],
+      "priority": 95,
+      "always_with_bio": true
+    },
+    {
+      "id": "post_sex_personality",
+      "title": "性爱后性格恢复",
+      "path": "iron/post_sex_personality.md",
+      "tags": [
+        "iron",
+        "nsfw"
+      ],
+      "keywords": [
+        "性爱",
+        "事后",
+        "高潮",
+        "射精",
+        "做爱",
+        "操"
+      ],
+      "priority": 90,
+      "always_with_bio": false
+    },
+    {
+      "id": "protect_user_persona",
+      "title": "用户人格保护",
+      "path": "iron/protect_user_persona.md",
+      "tags": [
+        "iron"
+      ],
+      "keywords": [
+        "暴君",
+        "黑化"
+      ],
+      "priority": 92,
+      "always_with_bio": true
+    },
+    {
+      "id": "info_isolation",
+      "title": "信息隔离",
+      "path": "iron/info_isolation.md",
+      "tags": [
+        "iron"
+      ],
+      "keywords": [],
+      "priority": 80,
+      "always_with_bio": false
+    },
+    {
+      "id": "bio_stages",
+      "title": "BIO阶段行为",
+      "path": "behavior/bio_stages.md",
+      "tags": [
+        "bio",
+        "behavior"
+      ],
+      "keywords": [
+        "迫切",
+        "应急",
+        "关注"
+      ],
+      "priority": 85,
+      "always_with_bio": true
+    }
+  ]
+}

@@ -1,0 +1,3154 @@
+// ============================================================================
+// yuzuki-Memory task runner.
+// Handles plugin-owned trace/summary tasks without touching SillyTavern chat text.
+// ============================================================================
+(function () {
+    'use strict';
+
+    const YuzukiMemory = window.YuzukiMemory = window.YuzukiMemory || {};
+    const TAG_PRESETS_STORAGE_KEY = 'yzm_memory_global_tag_presets';
+    const TAG_ACTIVE_PRESET_STORAGE_KEY = 'yzm_memory_global_tag_active_preset';
+    const LLM_API_PRESETS_STORAGE_KEY = 'yzm_memory_global_llm_api_presets';
+    const LLM_API_MODE_STORAGE_KEY = 'yzm_memory_global_llm_api_mode';
+    const LLM_API_ACTIVE_PRESET_STORAGE_KEY = 'yzm_memory_global_llm_api_active_preset';
+    const PROMPT_SCHEMES_STORAGE_KEY = 'yzm_memory_global_prompt_schemes';
+    const PROMPT_SCHEME_GLOBAL_ACTIVE_STORAGE_KEY = 'yzm_memory_global_prompt_scheme_active';
+    const PROMPT_SCHEME_CHARACTER_BINDINGS_STORAGE_KEY = 'yzm_memory_global_prompt_scheme_character_bindings';
+    const AUTO_SUMMARY_SETTINGS_STORAGE_KEY = 'yzm_memory_global_auto_summary_settings';
+    const PLUGIN_SETTINGS_STORAGE_KEY = 'yzm_memory_global_plugin_settings';
+    const FIXED_SUMMARY_TABLE_ID = 'memory_summary';
+    const PLOT_SUMMARY_TABLE_ID = 'plot_summary';
+    const AI_TAG_DIAGNOSTIC_PROMPT = `你是一个剧情记录系统的标签过滤专家。你的任务是分析 AI 的回复文本，制定最优的标签过滤方案（黑名单或白名单）。
+
+【系统过滤机制说明】
+- 黑名单 (blacklist)：列出的标签及其内部内容会被删除，保留剩下的所有内容（包括裸文本和其他未列出的标签）。
+- 白名单 (whitelist)：仅提取并保留列出的标签内部的内容，其他所有内容（包括裸文本和其他标签）都会被删除。
+
+【核心决策逻辑】
+你必须首先寻找“剧情正文”（即角色的对话、动作描写、时间状态栏等核心可见内容）所在的位置：
+1. 如果正文是裸文本（即正文没有被任何特定标签包裹）：
+   绝对不能使用白名单，因为白名单会删除不在标签内的裸文本正文。
+   只能使用黑名单，将需要剔除的后台标签（如 think、system、Memory 等）填入 blacklist。
+2. 如果正文或时间被特定标签包裹（例如 <content>正文</content> 或 [时间]正文[/时间]）：
+   可以使用白名单。
+   如果干扰后台标签很多，而有用正文标签只有一两个，优先使用 whitelist。
+   白名单中必须同时包含正文标签和时间标签（如 time、globalTime、[时间] 等），缺一不可。
+
+【标签格式提取要求】
+- 方括号标签：必须包含方括号，如 "[歌曲]"、"[动作]"。
+- 尖括号标签：只提取标签名，不带括号，如 "think"、"Memory"、"globalTime"。
+- HTML 注释：用 "!--" 表示。
+
+【分析任务】
+请分析以下 AI 回复的原始文本，判断正文的位置，并给出最简洁的过滤方案。
+文本内容：
+---
+{{RAW_TEXT}}
+---
+
+【输出要求】
+请仅输出纯 JSON 格式，严格遵循以下结构：
+{
+  "reasoning": "简述正文是裸文本还是被标签包裹，以及为什么选择黑名单或白名单",
+  "blacklist": ["需要删除的标签1", "需要删除的标签2"],
+  "whitelist": ["需要保留的标签"]
+}`;
+    let autoSummaryBound = false;
+    let autoSummaryTimer = null;
+    let autoSummaryRunning = false;
+    let autoSummaryPromptOpen = false;
+    let autoTaskArmed = false;
+    let autoTaskSessionId = '';
+    let autoTaskBaselineChatLength = 0;
+    let autoTaskSessionPollTimer = null;
+    let autoTaskCallbacks = {};
+    let autoTaskMessageSignature = '';
+    let autoTaskMessageStableSince = 0;
+    const AUTO_TASK_MESSAGE_STABLE_MS = 1200;
+
+    function isPluginTaskBusy() {
+        return window.isSummarizing === true
+            || window.yzmMemoryManualTaskRunning === true
+            || autoSummaryRunning
+            || autoSummaryPromptOpen;
+    }
+
+    function isManualTaskBusy() {
+        return window.yzmMemoryManualTaskRunning === true;
+    }
+
+    function formatDisplayFloorRange(start, end) {
+        const from = Math.max(0, Math.round(Number(start) || 0));
+        const exclusiveEnd = Math.max(from, Math.round(Number(end) || 0));
+        return `${from}-${Math.max(from, exclusiveEnd - 1)}`;
+    }
+
+    function notifyAutoTaskFailure(task = {}, error = '', callbacks = {}) {
+        const taskTitle = String(task?.title || '自动记忆任务').trim();
+        const message = String(error?.message || error || '未知错误').trim();
+        const range = Number.isFinite(Number(task?.start)) && Number.isFinite(Number(task?.end))
+            ? `（楼层 ${formatDisplayFloorRange(task.start, task.end)}）`
+            : '';
+        const retryHint = task?.type === 'trace' ? '填表指针未推进，后续正文结束后会继续尝试补跑。' : '总结指针未推进，后续正文结束后会继续尝试补跑。';
+        const notification = `${taskTitle}失败${range}。${retryHint}`;
+        const detail = message
+            ? `${taskTitle}失败${range}：${message}\n${retryHint}`
+            : `${taskTitle}失败${range}。\n${retryHint}`;
+        let handled = false;
+        if (typeof callbacks.onAutoTaskFailure === 'function') {
+            try {
+                const callbackResult = callbacks.onAutoTaskFailure({ task, taskTitle, message, range, retryHint, notification, detail });
+                if (callbackResult !== false) {
+                    handled = true;
+                    Promise.resolve(callbackResult).catch((callbackError) => {
+                        console.warn('[yuzuki-Memory] Failed to show auto task failure dialog:', callbackError);
+                    });
+                }
+            } catch (callbackError) {
+                console.warn('[yuzuki-Memory] Failed to show auto task failure dialog:', callbackError);
+            }
+        }
+        let notified = false;
+        try {
+            if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') {
+                toastr.error(notification, '柚月记忆', { timeOut: 8000 });
+                notified = true;
+            }
+        } catch (_error) {}
+        if (!handled && !notified) {
+            try {
+                if (typeof window.alert === 'function') window.alert(detail);
+            } catch (_error) {}
+        }
+        console.warn(`[yuzuki-Memory] ${detail}`);
+    }
+
+    function notifyAutoTaskStarted(task = {}) {
+        const taskTitle = String(task?.title || '自动记忆任务').trim();
+        const range = Number.isFinite(Number(task?.start)) && Number.isFinite(Number(task?.end))
+            ? `（楼层 ${formatDisplayFloorRange(task.start, task.end)}）`
+            : '';
+        const detail = `${taskTitle}已开始${range}，正在请求填表 API，请等待完成后再发送正文。`;
+        try {
+            if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
+                toastr.info(detail, '柚月记忆', { timeOut: 5000, preventDuplicates: true });
+                return;
+            }
+        } catch (_error) {}
+        console.info(`[yuzuki-Memory] ${detail}`);
+    }
+
+    function notifyAutoTaskSuccess(task = {}, result = {}) {
+        const taskTitle = String(task?.title || '自动记忆任务').trim();
+        const range = Number.isFinite(Number(result?.range?.start ?? task?.start)) && Number.isFinite(Number(result?.range?.end ?? task?.end))
+            ? `（楼层 ${formatDisplayFloorRange(result?.range?.start ?? task.start, result?.range?.end ?? task.end)}）`
+            : '';
+        const count = Number(result?.count) || 0;
+        const detail = task?.type === 'trace'
+            ? `${taskTitle}完成${range}：写入 ${count} 条，填表指针已推进。`
+            : `${taskTitle}完成${range}。`;
+        try {
+            if (typeof toastr !== 'undefined' && typeof toastr.success === 'function') {
+                toastr.success(detail, '柚月记忆', { timeOut: 5000 });
+                return;
+            }
+        } catch (_error) {}
+        console.log(`[yuzuki-Memory] ${detail}`);
+    }
+
+    function parseJsonStorage(key, fallback) {
+        const globalValue = YuzukiMemory.GlobalSettings?.get?.(key, undefined);
+        if (globalValue !== undefined) return globalValue === null ? fallback : globalValue;
+        try {
+            const parsed = JSON.parse(localStorage.getItem(key) || '');
+            return parsed === undefined || parsed === null ? fallback : parsed;
+        } catch {
+            return fallback;
+        }
+    }
+
+    function splitTagText(text = '') {
+        return String(text || '')
+            .split(/[,，\n]+/)
+            .map((tag) => tag.trim())
+            .filter(Boolean);
+    }
+
+    function normalizeTagList(tags) {
+        const seen = new Set();
+        return (Array.isArray(tags) ? tags : splitTagText(tags))
+            .map((tag) => String(tag || '').trim())
+            .filter((tag) => {
+                if (!tag || seen.has(tag)) return false;
+                seen.add(tag);
+                return true;
+            });
+    }
+
+    function getActiveTagPreset() {
+        const presets = parseJsonStorage(TAG_PRESETS_STORAGE_KEY, []);
+        if (!Array.isArray(presets)) return null;
+        const activeId = String(parseJsonStorage(TAG_ACTIVE_PRESET_STORAGE_KEY, '') || '').trim();
+        const activePreset = activeId ? presets.find((preset) => preset?.id === activeId) : null;
+        return activePreset || presets.find((preset) => preset && (preset.blacklist?.length || preset.whitelist?.length)) || null;
+    }
+
+    function getPluginSettings() {
+        const settings = parseJsonStorage(PLUGIN_SETTINGS_STORAGE_KEY, {});
+        return {
+            enableFilling: settings?.enableFilling !== false,
+            includeCharacterGreetingInTasks: settings?.includeCharacterGreetingInTasks === true,
+            fillMode: settings?.fillMode === 'batch' ? 'batch' : 'realtime',
+            traceBatchEnabled: settings?.traceBatchEnabled !== false,
+            autoTraceBatchSize: Math.max(1, Math.round(Number(settings?.autoTraceBatchSize ?? settings?.traceBatchSize) || 40)),
+            traceBatchSize: Math.max(1, Math.round(Number(settings?.traceBatchSize) || 40)),
+            traceBatchDelay: Math.max(0, Math.round(Number(settings?.traceBatchDelay ?? 2) || 0)),
+            traceDirectTrigger: true,
+            traceRunMode: settings?.traceRunMode === 'silent' ? 'silent' : 'confirm',
+        };
+    }
+
+    function escapeRegExp(value) {
+        return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function filterContentByTags(content, preset = getActiveTagPreset()) {
+        if (!content || !preset) return String(content || '');
+        let result = String(content || '');
+        normalizeTagList(preset.blacklist).forEach((tag) => {
+            let re;
+            if (tag.startsWith('!--')) {
+                re = new RegExp(`<!--[\\s\\S]*?-->`, 'gi');
+            } else if (tag.startsWith('[') && tag.endsWith(']')) {
+                const inner = escapeRegExp(tag.slice(1, -1));
+                re = new RegExp(`\\[${inner}(?:\\s+[^\\]]*)?\\][\\s\\S]*?\\[\\/${inner}\\s*\\]`, 'gi');
+            } else {
+                const safe = escapeRegExp(tag);
+                re = new RegExp(`<${safe}(?:\\s+[^>]*)?>[\\s\\S]*?<\\/${safe}\\s*>`, 'gi');
+            }
+            let previous = '';
+            let guard = 0;
+            while (previous !== result && guard < 50) {
+                previous = result;
+                result = result.replace(re, '');
+                guard += 1;
+            }
+        });
+
+        const whitelist = normalizeTagList(preset.whitelist);
+        if (whitelist.length) {
+            const extracted = [];
+            whitelist.forEach((tag) => {
+                let re;
+                if (tag.startsWith('!--')) {
+                    re = /<!--([\s\S]*?)-->/gi;
+                } else if (tag.startsWith('[') && tag.endsWith(']')) {
+                    const inner = escapeRegExp(tag.slice(1, -1));
+                    re = new RegExp(`\\[${inner}(?:\\s+[^\\]]*)?\\]([\\s\\S]*?)(?:\\[\\/${inner}\\s*\\]|$)`, 'gi');
+                } else {
+                    const safe = escapeRegExp(tag);
+                    re = new RegExp(`<${safe}(?:\\s+[^>]*)?>([\\s\\S]*?)(?:<\\/${safe}\\s*>|$)`, 'gi');
+                }
+                let match;
+                while ((match = re.exec(result)) !== null) {
+                    const text = String(match[1] || '').trim();
+                    if (text) extracted.push(text);
+                }
+            });
+            if (extracted.length) result = extracted.join('\n\n');
+        }
+        return result.trim();
+    }
+
+    function stripMemoryTags(text = '') {
+        return String(text || '')
+            .replace(/<Memory>[\s\S]*?<\/Memory>/gi, '')
+            .replace(/<GaigaiMemory>[\s\S]*?<\/GaigaiMemory>/gi, '')
+            .replace(/\{\{(?:DATABASE_SCHEMA|TABLE_DEFINITIONS|TARGET_TABLE_DEFINITIONS|OPTIMIZE_TABLE_DEFINITIONS|BRANCH_SUMMARY_NAMES|MEMORY_SUMMARY(?:_[^{}]+)?|MEMORY_TABLE(?:_[^{}]+)?|MEMORY|MEMORY_PROMPT|VECTOR_MEMORY)\}\}/gi, '')
+            .trim();
+    }
+
+    function stripImages(text = '') {
+        return String(text || '')
+            .replace(/<img[^>]*src=["']data:image[^"']*["'][^>]*>/gi, '[图片]')
+            .replace(/!\[[^\]]*\]\(data:image[^)]*\)/gi, '[图片]');
+    }
+
+    function getContext() {
+        return typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function'
+            ? SillyTavern.getContext()
+            : null;
+    }
+
+    function getCurrentCharacterPromptKeys() {
+        const ctx = getContext() || {};
+        if (ctx.groupId) return [`group:${ctx.groupId}`];
+        const character = Array.isArray(ctx.characters) ? ctx.characters[ctx.characterId] : null;
+        const characterId = ctx.characterId;
+        return [...new Set([
+            character?.avatar,
+            character?.name,
+            ctx.name2,
+            ctx.characterName,
+            characterId,
+        ]
+            .map((value) => String(value ?? '').trim())
+            .filter(Boolean)
+            .map((value) => `char:${value}`))];
+    }
+
+    function getCurrentSessionId() {
+        const ctx = getContext() || {};
+        const chatId = ctx.chatMetadata?.file_name || ctx.chatId || ctx.chat?.file_name || '';
+        if (!chatId) return '';
+        if (ctx.groupId) return `group:${ctx.groupId}:${chatId}`;
+        const character = Array.isArray(ctx.characters) ? ctx.characters[ctx.characterId] : null;
+        const characterId = ctx.characterId || character?.avatar || character?.name || ctx.name2 || ctx.characterName;
+        return characterId ? `char:${characterId}:${chatId}` : `chat:${chatId}`;
+    }
+
+    function normalizeFloorScope(scope, fallback = null) {
+        return YuzukiMemory.Storage?.normalizeFloorScope?.(scope, fallback) || scope || fallback || null;
+    }
+
+    function getCurrentFloorScope(state = null) {
+        return normalizeFloorScope(
+            state?.currentFloorScope,
+            YuzukiMemory.Storage?.getCurrentFloorScope?.(state?.sessionId || getCurrentSessionId())
+        );
+    }
+
+    function getRecordFloorScope(record, fallback = null) {
+        return YuzukiMemory.Storage?.getRecordFloorScope?.(record, fallback)
+            || normalizeFloorScope(record?.floorScope || record?.meta?.yzmMemoryTask?.floorScope, fallback);
+    }
+
+    function isSameFloorScope(left, right) {
+        if (YuzukiMemory.Storage?.isSameFloorScope) return YuzukiMemory.Storage.isSameFloorScope(left, right);
+        const leftScope = normalizeFloorScope(left);
+        const rightScope = normalizeFloorScope(right);
+        return !!leftScope && !!rightScope && leftScope.id === rightScope.id;
+    }
+
+    function getChatLength() {
+        const chat = getContext()?.chat;
+        return Array.isArray(chat) ? chat.length : 0;
+    }
+
+    function getLatestChatMessage() {
+        const chat = getContext()?.chat;
+        return Array.isArray(chat) && chat.length ? chat[chat.length - 1] : null;
+    }
+
+    function getLatestAssistantChatMessage() {
+        const chat = getContext()?.chat;
+        if (!Array.isArray(chat) || !chat.length) return null;
+        for (let index = chat.length - 1; index >= 0; index -= 1) {
+            const message = chat[index];
+            if (!message || isPluginMessage(message)) continue;
+            if (message.is_user === true || message.role === 'user' || message.role === 'system') continue;
+            const text = getChatText(message);
+            if (!String(text || '').trim()) continue;
+            return { message, index, text };
+        }
+        return null;
+    }
+
+    function isLatestAssistantMessage() {
+        const message = getLatestChatMessage();
+        if (!message || isPluginMessage(message)) return false;
+        if (message.is_user === true || message.role === 'user') return false;
+        if (message.role === 'system') return false;
+        return Boolean(stripMemoryTags(getChatText(message)).trim());
+    }
+
+    function refreshAutoTaskBaseline() {
+        window.clearTimeout(autoSummaryTimer);
+        autoTaskSessionId = getCurrentSessionId();
+        autoTaskBaselineChatLength = getChatLength();
+        autoTaskArmed = false;
+        autoTaskMessageSignature = '';
+        autoTaskMessageStableSince = 0;
+    }
+
+    function isAutoTaskStateReady(callbacks = {}) {
+        if (YuzukiMemory.Storage?.isSessionSwitching?.() === true) return false;
+        if (typeof callbacks.isStateReady === 'function') return callbacks.isStateReady() === true;
+        return true;
+    }
+
+    function cancelPendingAutoTask() {
+        window.clearTimeout(autoSummaryTimer);
+        autoTaskArmed = false;
+        autoTaskBaselineChatLength = getChatLength();
+        autoTaskMessageSignature = '';
+        autoTaskMessageStableSince = 0;
+    }
+
+    function getLatestAssistantMessageSignature() {
+        const latest = getLatestAssistantChatMessage();
+        if (!latest) return '';
+        const swipeId = Number(latest.message?.swipe_id ?? 0);
+        return [getCurrentSessionId(), latest.index, swipeId, latest.text].join('\n');
+    }
+
+    function markLatestAssistantMessageActivity() {
+        const signature = getLatestAssistantMessageSignature();
+        if (signature !== autoTaskMessageSignature) {
+            autoTaskMessageSignature = signature;
+            autoTaskMessageStableSince = Date.now();
+        }
+        return signature;
+    }
+
+    function isLatestAssistantMessageStable() {
+        const signature = markLatestAssistantMessageActivity();
+        return Boolean(
+            signature
+            && autoTaskMessageStableSince > 0
+            && Date.now() - autoTaskMessageStableSince >= AUTO_TASK_MESSAGE_STABLE_MS
+        );
+    }
+
+    function getRuntimeNames() {
+        const ctx = getContext() || {};
+        const character = Array.isArray(ctx.characters) ? ctx.characters[ctx.characterId] : null;
+        return {
+            user: String(ctx.name1 || ctx.userName || ctx.playerName || 'User'),
+            char: String(character?.name || ctx.name2 || ctx.characterName || ctx.name || 'Character'),
+        };
+    }
+
+    function getChatText(message) {
+        const swipeId = Number(message?.swipe_id ?? 0);
+        if (Array.isArray(message?.swipes) && message.swipes.length > swipeId) return String(message.swipes[swipeId] || '');
+        return String(message?.mes || message?.content || '');
+    }
+
+    function isPluginMessage(message) {
+        return !!(message?.isGaigaiData || message?.isGaigaiPrompt || message?.isPhoneMessage || message?.yzmMemoryInternal);
+    }
+
+    function isDialogueFloorMessage(message) {
+        if (!message || typeof message !== 'object') return false;
+        if (message.is_user === true || message.is_user === false) return true;
+        const role = String(message.role || '').toLowerCase();
+        return role === 'user' || role === 'assistant';
+    }
+
+    function shouldSkipTaskRangeMessage(message) {
+        if (!message || isPluginMessage(message)) return true;
+        const role = String(message.role || '').toLowerCase();
+        if (role !== 'system') return false;
+        return !isDialogueFloorMessage(message);
+    }
+
+    function chatMessagesFromRange(start, end, options = {}) {
+        const ctx = getContext();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+        const names = getRuntimeNames();
+        const userName = names.user;
+        const charName = names.char;
+        const from = Math.max(0, Math.min(Number(start) || 0, chat.length));
+        const to = Math.max(from, Math.min(Number(end) || chat.length, chat.length));
+        const tagPreset = options.tagPreset === false ? null : getActiveTagPreset();
+        const messages = [];
+
+        chat.slice(from, to).forEach((message, offset) => {
+            if (shouldSkipTaskRangeMessage(message)) return;
+            let content = stripImages(stripMemoryTags(getChatText(message)));
+            content = filterContentByTags(content, tagPreset);
+            if (!content.trim()) return;
+            const isUser = message.is_user === true || message.role === 'user';
+            const name = message.name || (isUser ? userName : charName);
+            const floor = from + offset;
+            messages.push({
+                role: isUser ? 'user' : 'assistant',
+                content: `[楼层 ${floor}] ${name}: ${content}`,
+            });
+        });
+
+        return { ctx, chat, messages, start: from, end: to, userName, charName };
+    }
+
+    function compactLines(lines) {
+        return lines.map((line) => String(line || '').trim()).filter(Boolean).join('\n');
+    }
+
+    function compactField(label, value) {
+        const text = String(value || '').trim();
+        if (!text) return '';
+        const normalized = text.replace(/\r\n/g, '\n').trim();
+        return `${label}：${normalized}`;
+    }
+
+    function firstTextValue(source, keys = []) {
+        if (!source || typeof source !== 'object') return '';
+        for (const key of keys) {
+            const value = source[key];
+            if (typeof value === 'string' && value.trim()) return value.trim();
+        }
+        return '';
+    }
+
+    function getRuntimeCharacter() {
+        const ctx = getContext() || {};
+        return Array.isArray(ctx.characters) ? ctx.characters[ctx.characterId] : null;
+    }
+
+    function buildRuntimeBackgroundText(options = {}) {
+        const ctx = getContext() || {};
+        const names = getRuntimeNames();
+        const character = getRuntimeCharacter() || {};
+        const persona = ctx.persona || ctx.userPersona || ctx.persona_description || ctx.user_description || ctx.power_user?.persona_description || '';
+        const chatMetadata = ctx.chatMetadata && typeof ctx.chatMetadata === 'object' ? ctx.chatMetadata : {};
+        const includeCharacterGreeting = getPluginSettings().includeCharacterGreetingInTasks;
+        const chatMetadataKeys = options.includeChatSummary === false
+            ? ['note_prompt', 'scenario', 'description']
+            : ['note_prompt', 'scenario', 'summary', 'description'];
+        const lines = [
+            '【背景资料】',
+            `角色：${names.char}`,
+            `用户：${names.user}`,
+            compactField('用户信息', persona),
+            compactField('角色描述', firstTextValue(character, ['description', 'desc'])),
+            compactField('角色性格', firstTextValue(character, ['personality'])),
+            compactField('场景/故事背景', firstTextValue(character, ['scenario', 'world_scenario'])),
+            includeCharacterGreeting ? compactField('开场消息', firstTextValue(character, ['first_mes', 'first_message', 'firstMessage'])) : '',
+            compactField('对话示例', firstTextValue(character, ['mes_example', 'example_dialogue'])),
+            compactField('角色备注', firstTextValue(character, ['creatorcomment', 'creator_comment', 'comment', 'notes'])),
+            compactField('聊天备注', firstTextValue(chatMetadata, chatMetadataKeys)),
+        ];
+        return compactLines(lines);
+    }
+
+    async function buildWorldbookContextMessage(state, options = {}) {
+        if (options.includeWorldbook === false) return null;
+        try {
+            return await YuzukiMemory.WorldbookManager?.buildWorldbookMessage?.(state, {
+                includeEntries: true,
+                force: options.forceWorldbookRefresh === true,
+            }) || null;
+        } catch (error) {
+            console.warn('[yuzuki-Memory] 读取任务世界书失败:', error);
+            return null;
+        }
+    }
+
+    function stateTables(state) {
+        return Array.isArray(state?.tables) ? state.tables : [];
+    }
+
+    function stateRecords(state, tableId) {
+        const records = state?.records?.[tableId];
+        return Array.isArray(records) ? records : [];
+    }
+
+    function cleanColumnName(column) {
+        return String(column || '').trim().replace(/^[#*]+/, '').trim();
+    }
+
+    function getColumnModifiers(column) {
+        const match = String(column || '').trim().match(/^[#*]+/);
+        return match ? match[0] : '';
+    }
+
+    function isAppendColumn(column) {
+        return getColumnModifiers(column).includes('#');
+    }
+
+    function isFillOnceColumn(column) {
+        return getColumnModifiers(column).includes('*');
+    }
+
+    function getPrimaryColumn(table) {
+        return cleanColumnName(table?.columns?.[0]) || '名称';
+    }
+
+    function recordTitle(table, record) {
+        return String(record?.values?.[getPrimaryColumn(table)] || '').trim();
+    }
+
+    function recordToText(table, record) {
+        if (!table || !record || record.hidden) return '';
+        const values = record.values && typeof record.values === 'object' ? record.values : {};
+        const body = (table.columns || [])
+            .map((column) => {
+                const name = cleanColumnName(column);
+                const rawValue = String(values[name] ?? values[column] ?? '').trim();
+                const value = table.id === PLOT_SUMMARY_TABLE_ID
+                    ? filterPlotSummaryValue(record, column, rawValue)
+                    : rawValue;
+                return value ? `${name}: ${value}` : '';
+            })
+            .filter(Boolean)
+            .join('；');
+        return body ? `- ${body}` : '';
+    }
+
+    function getPlotSummaryKindByColumn(column) {
+        return cleanColumnName(column) === '支线' ? 'branch' : 'main';
+    }
+
+    function filterPlotSummaryValue(record, column, value) {
+        const text = String(value || '').trim();
+        if (!text) return '';
+        const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        if (!lines.length) return '';
+        const kind = getPlotSummaryKindByColumn(column);
+        const states = Array.isArray(record?.hiddenPlotItems?.[kind])
+            ? record.hiddenPlotItems[kind].map(Boolean)
+            : null;
+        if (!states) {
+            return record?.hiddenKinds?.[kind] ? '' : lines.join('\n');
+        }
+        return lines.filter((_line, index) => !states[index]).join('\n');
+    }
+
+    function tablesToReferenceText(state, options = {}) {
+        return stateTables(state)
+            .filter((table) => !table.hidden && table.id !== FIXED_SUMMARY_TABLE_ID)
+            .filter((table) => !options.tableId || table.id === options.tableId)
+            .map((table) => {
+                const rows = stateRecords(state, table.id).map((record) => recordToText(table, record)).filter(Boolean);
+                return compactLines([`【当前世界状态参考—${table.name}】`, rows.length ? rows.join('\n') : '（当前暂无数据）']);
+            })
+            .filter(Boolean)
+            .join('\n\n');
+    }
+
+    function buildDatabaseSchemaText(state, options = {}) {
+        if (YuzukiMemory.VariableInjector?.buildDatabaseSchemaText) {
+            return YuzukiMemory.VariableInjector.buildDatabaseSchemaText(state, options);
+        }
+        const lines = stateTables(state)
+            .filter((table) => !table.hidden && table.id !== FIXED_SUMMARY_TABLE_ID)
+            .filter((table) => !options.tableId || table.id === options.tableId)
+            .map((table) => {
+                if (table.id === PLOT_SUMMARY_TABLE_ID) {
+                    return '#剧情摘要：包含 #主线摘要：摘要名称，日期，摘要内容；#支线摘要：日期，摘要内容';
+                }
+                const columns = (table.columns || []).map(cleanColumnName).filter(Boolean);
+                const fields = columns.map((column, index) => {
+                    if (index !== 0) return column;
+                    return table.id === 'character_profile'
+                        ? `${column}(主键；值含“|”时各姓名均指同一角色，第一段为主姓名)`
+                        : `${column}(主键)`;
+                }).join(', ');
+                return `#${table.name}：包含 ${fields}`;
+            })
+            .filter(Boolean);
+        return compactLines(lines);
+    }
+
+    function getOptionTargetTable(state, options = {}) {
+        const tableId = String(options.tableId || '').trim();
+        return tableId ? findTargetTable(state, tableId) : null;
+    }
+
+    function buildTraceTargetRestrictionText(state, options = {}) {
+        const targetTable = getOptionTargetTable(state, options);
+        if (!targetTable) return '';
+        const schema = buildDatabaseSchemaText(state, { ...options, tableId: targetTable.id });
+        return compactLines([
+            '【目标更新限制】',
+            `本次指定只更新：${targetTable.name}`,
+            schema ? `目标表结构：\n${schema}` : '',
+        ]);
+    }
+
+    function buildBranchSummaryNamesText(state) {
+        if (YuzukiMemory.VariableInjector?.buildBranchSummaryNamesText) {
+            return YuzukiMemory.VariableInjector.buildBranchSummaryNamesText(state);
+        }
+        const records = stateRecords(state, FIXED_SUMMARY_TABLE_ID);
+        const names = [];
+        records.forEach((record) => {
+            const values = record?.values || {};
+            const title = String(values.总结标题 || values.title || '').trim();
+            if (!/支线/.test(title)) return;
+            const name = String(values.核心角色 || values.character || values.角色名 || values.主视角 || '').trim();
+            if (name && !names.includes(name)) names.push(name);
+        });
+        return names.length ? names.join('、') : '（当前暂无已有支线核心角色）';
+    }
+
+    function resolveTaskPromptVariables(text, state, options = {}) {
+        const names = getRuntimeNames();
+        const suppressMemoryTables = options.suppressMemoryTables === true;
+        const suppressMemoryData = suppressMemoryTables || options.suppressMemoryData === true;
+        const targetTable = getOptionTargetTable(state, options);
+        const targetTableText = targetTable ? tablesToReferenceText(state, { ...options, tableId: targetTable.id }) : '';
+        return String(text || '')
+            .replace(/\{\{user\}\}/g, names.user)
+            .replace(/\{\{char\}\}/g, names.char)
+            .replace(/\{\{BRANCH_SUMMARY_NAMES\}\}/gi, () => buildBranchSummaryNamesText(state))
+            .replace(/\{\{(?:DATABASE_SCHEMA|TABLE_DEFINITIONS|TARGET_TABLE_DEFINITIONS|OPTIMIZE_TABLE_DEFINITIONS)\}\}/gi, () => suppressMemoryTables ? '' : buildDatabaseSchemaText(state, options))
+            .replace(/\{\{MEMORY_TABLE_(.+?)\}\}/gi, (_match, tableName) => suppressMemoryData ? '' : (YuzukiMemory.VariableInjector?.buildSpecificTableText?.(state, tableName) || ''))
+            .replace(/\{\{MEMORY_SUMMARY_(.+?)\}\}/gi, (_match, summaryKey) => suppressMemoryData ? '' : (YuzukiMemory.VariableInjector?.buildSpecificSummaryText?.(state, summaryKey) || ''))
+            .replace(/\{\{MEMORY_TABLE\}\}/gi, () => suppressMemoryData ? '' : (targetTableText || YuzukiMemory.VariableInjector?.buildAllTablesText?.(state) || tablesToReferenceText(state, options)))
+            .replace(/\{\{MEMORY_SUMMARY\}\}/gi, () => suppressMemoryData ? '' : (YuzukiMemory.VariableInjector?.buildSummaryText?.(state) || ''))
+            .replace(/\{\{MEMORY_PROMPT\}\}/gi, '')
+            .replace(/\{\{MEMORY\}\}/gi, () => {
+                if (suppressMemoryData) return '';
+                if (targetTableText) {
+                    return compactLines([
+                        YuzukiMemory.VariableInjector?.buildSummaryText?.(state),
+                        targetTableText,
+                    ]);
+                }
+                return YuzukiMemory.VariableInjector?.buildMemoryText?.(state)
+                    || compactLines([YuzukiMemory.VariableInjector?.buildSummaryText?.(state), tablesToReferenceText(state, options)]);
+            });
+    }
+
+    function getActivePromptScheme(state) {
+        const schemes = parseJsonStorage(PROMPT_SCHEMES_STORAGE_KEY, []);
+        const defaultSchemes = YuzukiMemory.PromptLibrary?.getDefaultSchemes?.() || [YuzukiMemory.PromptLibrary?.getDefaultScheme?.()];
+        const sourceSchemes = [
+            ...defaultSchemes,
+            ...(Array.isArray(schemes) ? schemes : []),
+        ].filter((scheme, index, list) => scheme && list.findIndex((entry) => entry?.id === scheme.id) === index);
+        const normalized = sourceSchemes.map((scheme) => {
+            const prompts = YuzukiMemory.PromptLibrary?.mergeSchemePrompts?.(scheme)
+                || (scheme?.prompts && typeof scheme.prompts === 'object' ? scheme.prompts : {});
+            return {
+                ...scheme,
+                prompts: {
+                    historian: String(prompts.historian || ''),
+                    traceRealtime: String(prompts.traceRealtime ?? prompts.trace ?? prompts.table ?? ''),
+                    traceBatch: String(prompts.traceBatch ?? ''),
+                    trace: String(prompts.trace ?? prompts.traceRealtime ?? prompts.table ?? ''),
+                    traceOptimize: String(prompts.traceOptimize ?? prompts.table ?? ''),
+                    summary: String(prompts.summary ?? ''),
+                    summaryOptimize: String(prompts.summaryOptimize ?? ''),
+                },
+            };
+        });
+        const bindings = parseJsonStorage(PROMPT_SCHEME_CHARACTER_BINDINGS_STORAGE_KEY, {});
+        const characterId = bindings && typeof bindings === 'object'
+            ? String(getCurrentCharacterPromptKeys().map((key) => bindings[key]).find(Boolean) || '')
+            : '';
+        const globalId = String(YuzukiMemory.GlobalSettings?.get?.(PROMPT_SCHEME_GLOBAL_ACTIVE_STORAGE_KEY, '')
+            ?? localStorage.getItem(PROMPT_SCHEME_GLOBAL_ACTIVE_STORAGE_KEY)
+            ?? '');
+        const activeId = characterId || globalId;
+        return normalized.find((scheme) => scheme.id === activeId)
+            || normalized[0]
+            || { prompts: YuzukiMemory.PromptLibrary?.mergeSchemePrompts?.({ prompts: {} }) || {} };
+    }
+
+    function getLlmMode() {
+        const mode = YuzukiMemory.GlobalSettings?.get?.(LLM_API_MODE_STORAGE_KEY, null)
+            ?? localStorage.getItem(LLM_API_MODE_STORAGE_KEY);
+        return mode === 'custom' ? 'custom' : 'tavern';
+    }
+
+    function getActiveLlmPreset() {
+        const presets = parseJsonStorage(LLM_API_PRESETS_STORAGE_KEY, []);
+        if (!Array.isArray(presets) || !presets.length) return null;
+        const activeId = String(YuzukiMemory.GlobalSettings?.get?.(LLM_API_ACTIVE_PRESET_STORAGE_KEY, '')
+            ?? localStorage.getItem(LLM_API_ACTIVE_PRESET_STORAGE_KEY)
+            ?? '');
+        return presets.find((preset) => preset.id === activeId) || presets[0] || null;
+    }
+
+    function createLlmRequestSnapshot() {
+        const mode = getLlmMode();
+        const preset = mode === 'custom' ? getActiveLlmPreset() : null;
+        return {
+            mode,
+            preset: preset ? JSON.parse(JSON.stringify(preset)) : null,
+        };
+    }
+
+    function buildTaskRequestMeta(options = {}) {
+        return {
+            kind: String(options.kind || options.autoTaskType || 'manual'),
+            floorScope: normalizeFloorScope(options.floorScope, getCurrentFloorScope()),
+            range: {
+                start: Math.max(0, Math.round(Number(options.start) || 0)),
+                end: Math.max(0, Math.round(Number(options.end) || 0)),
+            },
+        };
+    }
+
+    function captureTaskRequest(messages, options = {}) {
+        if (!YuzukiMemory.RequestProbe?.captureFromBody) return;
+        const snapshot = options.llmSnapshot && typeof options.llmSnapshot === 'object' ? options.llmSnapshot : null;
+        const mode = snapshot?.mode || getLlmMode();
+        const preset = mode === 'custom' ? (snapshot && 'preset' in snapshot ? snapshot.preset : getActiveLlmPreset()) : null;
+        const body = {
+            model: mode === 'custom' ? String(preset?.model || '') : 'SillyTavern',
+            messages,
+            yzmMemoryTask: buildTaskRequestMeta(options),
+            yzmMemoryInternalApi: true,
+        };
+        YuzukiMemory.RequestProbe.captureFromBody(body, 'yuzuki-memory://task', { preparedTask: true });
+    }
+
+    async function generate(messages, options = {}) {
+        if (!YuzukiMemory.LlmClient) return { success: false, error: 'LLM 客户端尚未加载。' };
+        const previousSummarizing = window.isSummarizing;
+        window.isSummarizing = true;
+        try {
+            const taskOptions = {
+                ...options,
+                yzmMemoryTask: buildTaskRequestMeta(options),
+                yzmMemoryInternalApi: true,
+            };
+            const snapshot = options.llmSnapshot && typeof options.llmSnapshot === 'object' ? options.llmSnapshot : null;
+            const mode = snapshot?.mode || getLlmMode();
+            const preset = mode === 'custom'
+                ? (snapshot && 'preset' in snapshot ? snapshot.preset : getActiveLlmPreset())
+                : null;
+            const requestMessages = await prepareTaskMessages(messages, mode, preset, taskOptions);
+            captureTaskRequest(requestMessages, options);
+            if (mode === 'custom') {
+                if (!preset) return { success: false, error: '未选择可用的 LLM API 预设。' };
+                const result = await YuzukiMemory.LlmClient.generateWithCustom(preset, requestMessages, { stream: preset.stream !== false, ...taskOptions });
+                return normalizeGenerationResult(result);
+            }
+            const shouldStream = options.stream !== undefined
+                ? options.stream !== false
+                : !['trace', 'traceOptimize'].includes(String(options.kind || ''));
+            const result = await YuzukiMemory.LlmClient.generateWithTavern(requestMessages, { ...taskOptions, stream: shouldStream });
+            return normalizeGenerationResult(result);
+        } finally {
+            window.isSummarizing = previousSummarizing;
+        }
+    }
+
+    function detectUpstreamErrorResponse(text = '') {
+        const raw = String(text || '').trim();
+        if (!raw) return null;
+        const payloads = parseJsonBlocks(raw);
+        const payload = payloads.find((entry) => entry && typeof entry === 'object' && !Array.isArray(entry) && entry.error);
+        if (!payload) return null;
+
+        const error = payload.error;
+        const detail = error && typeof error === 'object' ? error : { message: String(error || '') };
+        const code = Number(detail.code ?? detail.status ?? payload.code ?? payload.status);
+        const type = String(detail.type ?? payload.type ?? '').trim();
+        const message = String(detail.message ?? detail.error ?? error ?? '').trim();
+        const looksLikeApiError = (Number.isFinite(code) && code >= 400)
+            || /(?:server|api|upstream|gateway|rate|auth|timeout|error)/i.test(type)
+            || /(?:上游|空响应|服务器|网关|限流|超时|upstream|empty response|server_error|gateway|rate limit|timeout)/i.test(message);
+        if (!looksLikeApiError) return null;
+        return { raw, code: Number.isFinite(code) ? code : '', type, message };
+    }
+
+    function normalizeGenerationResult(result) {
+        if (!result?.success) return result;
+        const upstreamError = detectUpstreamErrorResponse(result.text);
+        if (!upstreamError) return result;
+        return {
+            ...result,
+            success: false,
+            error: `API 上游返回错误：\n${upstreamError.raw}`,
+            upstreamError,
+        };
+    }
+
+    function parseJsonBlock(text = '') {
+        const blocks = parseJsonBlocks(text);
+        if (blocks.length) return blocks[0];
+        throw new Error('未找到可解析的 JSON 结果。');
+    }
+
+    function parseJsonBlocks(text = '') {
+        const source = String(text || '').trim();
+        if (!source) return [];
+
+        try {
+            return [JSON.parse(source)];
+        } catch {
+            // Continue with tolerant extraction below.
+        }
+
+        return extractJsonValues(source)
+            .map((block) => {
+                try {
+                    return JSON.parse(block);
+                } catch (_error) {
+                    return null;
+                }
+            })
+            .filter((block) => block !== null);
+    }
+
+    function extractJsonValues(text = '') {
+        const source = String(text || '');
+        const values = [];
+        let cursor = 0;
+
+        while (cursor < source.length) {
+            const start = findJsonStart(source, cursor);
+            if (start < 0) break;
+
+            const end = findJsonEnd(source, start);
+            if (end > start) {
+                values.push(source.slice(start, end + 1));
+                cursor = end + 1;
+            } else {
+                cursor = start + 1;
+            }
+        }
+
+        return values;
+    }
+
+    function findJsonStart(text, fromIndex = 0) {
+        const objectIndex = text.indexOf('{', fromIndex);
+        const arrayIndex = text.indexOf('[', fromIndex);
+        if (objectIndex < 0) return arrayIndex;
+        if (arrayIndex < 0) return objectIndex;
+        return Math.min(objectIndex, arrayIndex);
+    }
+
+    function findJsonEnd(text, startIndex) {
+        const stack = [text[startIndex]];
+        let inString = false;
+        let escaped = false;
+
+        for (let index = startIndex + 1; index < text.length; index += 1) {
+            const char = text[index];
+
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (char === '\\') {
+                    escaped = true;
+                } else if (char === '"') {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (char === '"') {
+                inString = true;
+                continue;
+            }
+
+            if (char === '{' || char === '[') {
+                stack.push(char);
+                continue;
+            }
+
+            if (char !== '}' && char !== ']') continue;
+
+            const opener = stack[stack.length - 1];
+            const expected = opener === '{' ? '}' : ']';
+            if (char !== expected) return -1;
+
+            stack.pop();
+            if (!stack.length) return index;
+        }
+
+        return -1;
+    }
+
+    function normalizeTaskRows(parsed) {
+        const rows = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.records) ? parsed.records : []);
+        return rows
+            .map((row) => row && typeof row === 'object' ? row : null)
+            .filter(Boolean)
+            .map((row) => ({
+                table: String(row.table || row.tableId || row.tableName || '').trim(),
+                values: row.values && typeof row.values === 'object' ? row.values : row,
+            }));
+    }
+
+    function parseTraceResponse(text = '') {
+        const memoryText = normalizeMemoryEnvelope(text);
+        try {
+            const parsedBlocks = parseJsonBlocks(text);
+            if (!parsedBlocks.length) throw new Error(formatTraceParseError('未找到可解析的 JSON 结果。', text));
+            if (parsedBlocks.length === 1) return parsedBlocks[0];
+            const records = parsedBlocks.flatMap((block) => Array.isArray(block?.records) ? block.records : (Array.isArray(block) ? block : []));
+            const memoryRows = parsedBlocks.flatMap((block) => Array.isArray(block?.memoryRows) ? block.memoryRows : []);
+            if (records.length) return { records };
+            if (memoryRows.length) return { memoryRows };
+            return parsedBlocks[0];
+        } catch (error) {
+            const parser = YuzukiMemory.MemoryTagParser;
+            const rows = parser?.extractMemoryRows?.(memoryText) || parser?.extractMemoryRows?.(text) || [];
+            if (rows.length) return { memoryRows: rows };
+            const fallbackRows = parser?.parseMemoryText?.(memoryText) || parser?.parseMemoryText?.(text) || [];
+            if (fallbackRows.length) return { memoryRows: fallbackRows };
+            throw error;
+        }
+    }
+
+    function normalizeSummaryPayload(parsed) {
+        const source = parsed && typeof parsed === 'object' ? parsed : {};
+        let title = String(source.title || source['总结标题'] || source.name || '').trim();
+        const titleMatch = title.match(/^【?支线(?:总结|剧情)[-－—:： ]+(.+?)】?$/);
+        const branchCharacterFromTitle = titleMatch ? titleMatch[1].trim() : '';
+        if (branchCharacterFromTitle) title = '';
+        if (/^(总结标题|标题|主线(?:总结|剧情)|支线(?:总结|剧情))$/.test(title)) title = '';
+        const kindSource = String(source.kind || source.type || title || '').trim();
+        const kind = kindSource.includes('branch') || kindSource.includes('支线') || !!branchCharacterFromTitle ? 'branch' : 'main';
+        const summary = normalizeSummaryText(source.summary ?? source['总结内容']);
+        return {
+            kind,
+            title,
+            character: String(source.character || source.pov || source.npc || source['核心角色'] || source['角色名'] || source['主视角'] || branchCharacterFromTitle || '').trim(),
+            summary,
+            unresolved: Array.isArray(source.unresolved) ? source.unresolved.join('\n') : String(source.unresolved || source['未解决问题'] || '').trim(),
+            remark: String(source.remark || source.note || source['备注'] || '').trim(),
+        };
+    }
+
+    function normalizeSummaryText(value) {
+        if (Array.isArray(value)) {
+            return value.map((entry) => {
+                if (entry && typeof entry === 'object') {
+                    const time = String(entry.time || entry.date || entry.range || entry['时间'] || entry['日期'] || '').trim();
+                    const event = String(entry.event || entry.content || entry.summary || entry['事件'] || entry['内容'] || '').trim();
+                    return [time, event].filter(Boolean).join(' ');
+                }
+                return String(entry || '').trim();
+            }).filter(Boolean).join('\n');
+        }
+        return String(value || '').trim();
+    }
+
+    function normalizeTaskMessages(messages = []) {
+        return (Array.isArray(messages) ? messages : [])
+            .filter((message) => message?.content && String(message.content).trim());
+    }
+
+    function withMemoryPrefill(messages = [], prefill = '<Memory>\n') {
+        const normalized = normalizeTaskMessages(messages);
+        const last = normalized[normalized.length - 1];
+        if (last && ['assistant', 'model'].includes(String(last.role || '').toLowerCase())
+            && /^<Memory(?:\s+[^>]*)?>/i.test(String(last.content || '').trim())) {
+            return normalized;
+        }
+        return [...normalized, { role: 'assistant', content: prefill }];
+    }
+
+    async function prepareTaskMessages(messages, mode, preset, options = {}) {
+        let config = preset;
+        if (mode !== 'custom') {
+            try {
+                config = await YuzukiMemory.LlmClient?.getTavernStatus?.(options);
+            } catch (_error) {
+                config = null;
+            }
+        }
+        return YuzukiMemory.LlmClient?.supportsAssistantPrefill?.(config)
+            ? withMemoryPrefill(messages)
+            : normalizeTaskMessages(messages);
+    }
+
+    function normalizeMemoryEnvelope(text = '') {
+        let source = String(text || '').trim();
+        if (!source) return '';
+        source = source.replace(/^```(?:xml|html|memory)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+        const openMatch = source.match(/<Memory(?:\s+[^>]*)?>/i);
+        if (openMatch) {
+            source = source.slice(openMatch.index);
+            const afterOpen = source.slice(openMatch[0].length);
+            if (/^\s*<Memory(?:\s+[^>]*)?>/i.test(afterOpen)) {
+                source = afterOpen.replace(/^\s*<Memory(?:\s+[^>]*)?>/i, '<Memory>').trimStart();
+            }
+            return /<\/Memory>/i.test(source) ? source : `${source}\n</Memory>`;
+        }
+
+        source = source.replace(/^<\/Memory>/i, '').trim();
+        return `<Memory>\n${source}\n</Memory>`;
+    }
+
+    function previewRawModelText(text = '') {
+        const source = String(text || '').trim();
+        return source || '（空）';
+    }
+
+    function formatTraceParseError(message, text = '') {
+        return `${message}\n\n模型原始回复（完整）：\n${previewRawModelText(text)}`;
+    }
+
+    function formatSummaryParseError(message, text = '') {
+        return `${message}\n\n模型原始回复（完整）：\n${previewRawModelText(text)}`;
+    }
+
+    function getSummarySectionHeadingPattern() {
+        return /【\s*((?:主线|支线)(?:总结|剧情))\s*(?:[:：\-－—]\s*([^】]+?))?\s*】/g;
+    }
+
+    function normalizeSummarySectionHeadings(text = '') {
+        const source = String(text || '');
+        const matches = [...source.matchAll(getSummarySectionHeadingPattern())];
+        if (!matches.length) return source;
+
+        let output = '';
+        let cursor = 0;
+        let previousHeadingKey = '';
+        let previousHeadingType = '';
+        matches.forEach((match) => {
+            const between = source.slice(cursor, match.index);
+            const kind = match[1].includes('支线') ? 'branch' : 'main';
+            const character = String(match[2] || '').trim();
+            const headingKey = `${kind}:${kind === 'branch' ? character.toLowerCase() : ''}`;
+            const headingType = match[1].endsWith('剧情') ? 'plot' : 'summary';
+            const isAdjacentAliasDuplicate = previousHeadingKey === headingKey
+                && previousHeadingType !== headingType
+                && !between.trim();
+            if (!isAdjacentAliasDuplicate) {
+                output += `${between}【${kind === 'branch' ? '支线总结' : '主线总结'}${character ? `：${character}` : ''}】`;
+            }
+            previousHeadingKey = headingKey;
+            previousHeadingType = headingType;
+            cursor = (match.index || 0) + match[0].length;
+        });
+        return output + source.slice(cursor);
+    }
+
+    function getSummaryResponseIntegrityError(text = '', response = {}) {
+        let source = String(text || '').trim();
+        if (!source) return '模型返回的总结内容为空。';
+        if (response?.truncated === true || /达到最大 Token 限制|finish_reason=(?:length|MAX_TOKENS)/i.test(source)) {
+            return '模型输出达到最大 Token 限制，结果已被截断。';
+        }
+        source = source.replace(/^```(?:xml|html|memory)?\s*/i, '').replace(/```\s*$/i, '').trim();
+        const closeMatches = [...source.matchAll(/<\/Memory\s*>/gi)];
+        if (!closeMatches.length) return '总结回复缺少结尾 </Memory>，可能已被截断。';
+        if (closeMatches.length > 1) return '总结回复包含多个 </Memory> 结尾，疑似重复生成。';
+        const closeMatch = closeMatches[0];
+        const trailingText = source.slice((closeMatch.index || 0) + closeMatch[0].length).trim();
+        if (trailingText) return '总结回复在 </Memory> 之后仍有额外内容，疑似重复生成。';
+        const openMatches = [...source.matchAll(/<Memory(?:\s+[^>]*)?>/gi)];
+        if (openMatches.length > 1) return '总结回复包含多个 <Memory> 开头，疑似重复生成。';
+
+        const seenSections = new Set();
+        for (const match of source.matchAll(getSummarySectionHeadingPattern())) {
+            const kind = match[1].includes('支线') ? 'branch' : 'main';
+            const character = kind === 'branch' ? String(match[2] || '').trim().toLowerCase() : '';
+            const key = `${kind}:${character}`;
+            if (seenSections.has(key)) {
+                return kind === 'main'
+                    ? '总结回复包含多个【主线总结】分块，疑似重复生成。'
+                    : `总结回复重复生成了同一支线角色“${String(match[2] || '').trim()}”。`;
+            }
+            seenSections.add(key);
+        }
+        return '';
+    }
+
+    function canRepairSummaryMemoryEnvelope(text = '', response = {}) {
+        const source = String(text || '').trim();
+        if (!source || /<\/Memory\s*>/i.test(source)) return false;
+        if (response?.truncated === true || /达到最大 Token 限制|finish_reason=(?:length|MAX_TOKENS)/i.test(source)) return false;
+        if (response?.streamComplete === false) return false;
+        const termination = String(response?.streamTermination || '').trim().toLowerCase();
+        return !['eof', 'length', 'max_tokens', 'max_token'].includes(termination);
+    }
+
+    function normalizeCompletedSummaryMemoryEnvelope(text = '') {
+        const rawSource = String(text || '');
+        let source = rawSource.trim();
+        if (!source) return source;
+        source = source.replace(/^```(?:xml|html|memory)?\s*/i, '').trim();
+
+        const closeMatches = [...source.matchAll(/<\/Memory\s*>/gi)];
+        if (!closeMatches.length) return rawSource;
+
+        const closeMatch = closeMatches[closeMatches.length - 1];
+        const closeEnd = (closeMatch.index || 0) + closeMatch[0].length;
+        const trailingText = source.slice(closeEnd).trim();
+        const unexpectedTrailingText = trailingText.replace(/```(?:xml|html|memory)?/gi, '').trim();
+        if (unexpectedTrailingText) return rawSource;
+
+        const contentBeforeClose = source.slice(0, closeMatch.index || 0).trim();
+        const intermediateCloseMatches = closeMatches.slice(0, -1);
+        const hasUnstructuredContinuation = intermediateCloseMatches.some((match, index) => {
+            const segmentStart = (match.index || 0) + match[0].length;
+            const segmentEnd = intermediateCloseMatches[index + 1]?.index ?? contentBeforeClose.length;
+            const segment = contentBeforeClose.slice(segmentStart, segmentEnd)
+                .replace(/```(?:xml|html|memory)?/gi, '')
+                .trim();
+            return !getSummarySectionHeadingPattern().test(segment);
+        });
+        if (hasUnstructuredContinuation) return rawSource;
+
+        const openMatches = [...contentBeforeClose.matchAll(/<Memory(?:\s+[^>]*)?>/gi)];
+        if (openMatches.length > 1) return rawSource;
+
+        const bodyStart = openMatches.length
+            ? (openMatches[0].index || 0) + openMatches[0][0].length
+            : 0;
+        const body = contentBeforeClose
+            .slice(bodyStart)
+            .replace(/<\/Memory\s*>/gi, '')
+            .replace(/(?:^|\r?\n)\s*```(?:xml|html|memory)?\s*(?=\r?\n|$)/gi, '\n')
+            .trim();
+        return `<Memory>\n${body}\n</Memory>`;
+    }
+
+    function normalizeSummaryMemoryEnvelope(text = '', response = {}) {
+        const source = String(text || '');
+        if (canRepairSummaryMemoryEnvelope(source, response)) return normalizeMemoryEnvelope(source);
+        return normalizeCompletedSummaryMemoryEnvelope(source);
+    }
+
+    function normalizeSummaryGenerationText(text = '', response = {}) {
+        const source = String(text || '');
+        const envelopeNormalized = normalizeSummaryMemoryEnvelope(source, response);
+        return normalizeSummarySectionHeadings(envelopeNormalized);
+    }
+
+    function validateSummaryGenerationResponse(response = {}) {
+        const rawText = String(response?.text || '');
+        const normalizedText = normalizeSummaryGenerationText(rawText, response);
+        const error = getSummaryResponseIntegrityError(normalizedText, response);
+        if (!error) {
+            if (normalizedText === rawText) return response;
+            const envelopeNormalized = normalizeSummaryMemoryEnvelope(rawText, response);
+            return {
+                ...response,
+                text: normalizedText,
+                rawText,
+                memoryEnvelopeRepaired: envelopeNormalized !== rawText,
+                summaryHeadingsNormalized: normalizeSummarySectionHeadings(envelopeNormalized) !== envelopeNormalized,
+            };
+        }
+        return {
+            ...response,
+            success: false,
+            error: formatSummaryParseError(error, rawText),
+            text: rawText,
+        };
+    }
+
+    function extractMemorySummaryText(text = '') {
+        const source = normalizeMemoryEnvelope(text);
+        const match = source.match(/<Memory(?:\s+[^>]*)?>([\s\S]*?)<\/Memory>/i);
+        return match ? match[1].trim() : '';
+    }
+
+    function parseMemorySummarySections(text = '') {
+        const body = extractMemorySummaryText(text);
+        if (!body) throw new Error(formatSummaryParseError('未找到 <Memory>...</Memory> 总结标签。', text));
+
+        const matches = [...body.matchAll(getSummarySectionHeadingPattern())];
+        if (!matches.length) throw new Error(formatSummaryParseError('Memory 标签内未找到【主线总结】或【支线总结：角色名】分块。', text));
+
+        return matches.map((match, index) => {
+            const start = match.index + match[0].length;
+            const end = index + 1 < matches.length ? matches[index + 1].index : body.length;
+            const kindLabel = match[1];
+            const character = String(match[2] || '').trim();
+            const summary = body.slice(start, end).trim();
+            return {
+                kind: kindLabel.includes('支线') ? 'branch' : 'main',
+                title: '',
+                character: kindLabel.includes('支线') ? character : '',
+                summary,
+                unresolved: '',
+                remark: '',
+            };
+        }).filter((payload) => payload.summary && (payload.kind === 'main' || payload.character));
+    }
+
+    function parseSummaryResponse(text = '') {
+        const payloads = parseMemorySummarySections(text);
+        if (!payloads.length) throw new Error(formatSummaryParseError('Memory 总结内容为空，或支线缺少角色名。', text));
+        return payloads;
+    }
+
+    function getSummaryPreview(payload) {
+        if (!payload) return '';
+        return compactLines([
+            payload.title ? `标题：${payload.title}` : '',
+            payload.kind ? `类型：${payload.kind === 'branch' ? '支线' : '主线'}` : '',
+            payload.character ? `核心角色：${payload.character}` : '',
+            payload.summary ? `内容：${payload.summary}` : '',
+            payload.unresolved ? `未解决：${payload.unresolved}` : '',
+            payload.remark ? `备注：${payload.remark}` : '',
+        ]);
+    }
+
+    function getTracePreview(rows) {
+        if (rows?.memoryRows) {
+            return rows.memoryRows
+                .map((row, index) => {
+                    const values = Object.entries(row.values || {})
+                        .filter(([, value]) => String(value || '').trim())
+                        .map(([key, value]) => `${key}: ${value}`)
+                        .join('；');
+                    return `${index + 1}. ${row.table || '未指定表格'} - ${row.primaryValue || '未命名'}${values ? `；${values}` : ''}`;
+                })
+                .join('\n');
+        }
+        return normalizeTaskRows(rows)
+            .map((row, index) => {
+                const values = Object.entries(row.values || {})
+                    .filter(([, value]) => String(value || '').trim())
+                    .map(([key, value]) => `${key}: ${value}`)
+                    .join('；');
+                return `${index + 1}. ${row.table || '未指定表格'}${values ? ` - ${values}` : ''}`;
+            })
+            .join('\n');
+    }
+
+    function filterTraceResultByTarget(state, resultRows, options = {}) {
+        const targetTable = getOptionTargetTable(state, options);
+        if (!targetTable) return resultRows;
+        if (resultRows?.memoryRows) {
+            return {
+                ...resultRows,
+                memoryRows: resultRows.memoryRows
+                    .map((row) => row && !String(row.table || '').trim() ? { ...row, table: targetTable.name } : row)
+                    .filter((row) => findTargetTable(state, row?.table)?.id === targetTable.id),
+            };
+        }
+        const records = normalizeTaskRows(resultRows)
+            .map((row) => !row.table ? { ...row, table: targetTable.name } : row)
+            .filter((row) => findTargetTable(state, row.table)?.id === targetTable.id)
+            .map((row) => ({ table: row.table || targetTable.name, values: row.values || {} }));
+        return { records };
+    }
+
+    function createRecord(table, values = {}) {
+        return {
+            id: `record_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+            hidden: false,
+            ...([FIXED_SUMMARY_TABLE_ID, PLOT_SUMMARY_TABLE_ID].includes(table?.id) ? { floorScope: getCurrentFloorScope() } : {}),
+            values: Object.fromEntries((table?.columns || []).map((column) => {
+                const name = cleanColumnName(column);
+                return [name, String(values[name] ?? values[column] ?? '')];
+            })),
+        };
+    }
+
+    function findTargetTable(state, tableKey) {
+        const key = String(tableKey || '').trim();
+        const tables = stateTables(state).filter((table) => table.id !== FIXED_SUMMARY_TABLE_ID);
+        if (/主线摘要|支线摘要|剧情摘要/.test(key)) {
+            return tables.find((table) => table.id === PLOT_SUMMARY_TABLE_ID || table.name === '剧情摘要') || null;
+        }
+        return tables.find((table) => table.id === key)
+            || tables.find((table) => table.name === key)
+            || tables.find((table) => key && table.name.includes(key))
+            || null;
+    }
+
+    function upsertRecord(state, table, values = {}) {
+        if (!table) return null;
+        state.records = state.records && typeof state.records === 'object' ? state.records : {};
+        state.records[table.id] = Array.isArray(state.records[table.id]) ? state.records[table.id] : [];
+        const records = state.records[table.id];
+        const primary = getPrimaryColumn(table);
+        const normalizedValues = Object.fromEntries((table.columns || []).map((column) => {
+            const name = cleanColumnName(column);
+            return [name, String(values[name] ?? values[column] ?? values[name.toLowerCase()] ?? '')];
+        }));
+        const primaryValue = String(normalizedValues[primary] || values[primary] || values.name || values.title || '').trim();
+        if (primaryValue) normalizedValues[primary] = primaryValue;
+        if (!normalizedValues[primary]) normalizedValues[primary] = `${primary}${records.length + 1}`;
+        const hasValidUpdate = (table.columns || [])
+            .map(cleanColumnName)
+            .some((name) => name !== primary && String(normalizedValues[name] || '').trim());
+        if (!hasValidUpdate) return null;
+
+        const characterNameMatcher = table.id === 'character_profile' ? YuzukiMemory.CharacterNameMatcher : null;
+        let record = characterNameMatcher?.findMatchingRecord
+            ? characterNameMatcher.findMatchingRecord(records, primary, normalizedValues[primary])
+            : records.find((entry) => recordTitle(table, entry) === normalizedValues[primary]);
+        if (!record) {
+            if (characterNameMatcher?.formatNames) {
+                normalizedValues[primary] = characterNameMatcher.formatNames(normalizedValues[primary]);
+            }
+            record = createRecord(table, normalizedValues);
+            records.push(record);
+        } else {
+            record.values = record.values && typeof record.values === 'object' ? record.values : {};
+            if (!characterNameMatcher) record.values[primary] = normalizedValues[primary];
+            (table.columns || []).forEach((column) => {
+                const name = cleanColumnName(column);
+                if (name === primary) return;
+                const nextValue = String(normalizedValues[name] || '').trim();
+                if (!nextValue) return;
+                const currentValue = String(record.values[name] || '').trim();
+                if (isFillOnceColumn(column) && currentValue) return;
+                if (isAppendColumn(column) && table.id === 'character_profile' && name === '待办事项') {
+                    record.values[name] = YuzukiMemory.TodoManager?.mergeTodoTexts?.(record.values[name], nextValue)
+                        || [String(record.values[name] || '').trim(), nextValue].filter(Boolean).join('；');
+                    return;
+                }
+                record.values[name] = isAppendColumn(column)
+                    ? [String(record.values[name] || '').trim(), nextValue].filter(Boolean).join('；')
+                    : nextValue;
+            });
+        }
+        return record;
+    }
+
+    function appendPlotSummary(state, text, kind = 'main', options = {}) {
+        const table = stateTables(state).find((entry) => entry.id === PLOT_SUMMARY_TABLE_ID);
+        if (!table || !text) return null;
+        state.records = state.records && typeof state.records === 'object' ? state.records : {};
+        state.records[table.id] = Array.isArray(state.records[table.id]) ? state.records[table.id] : [];
+        let record = state.records[table.id][0];
+        if (!record) {
+            record = createRecord(table, {});
+            state.records[table.id].push(record);
+        }
+        const field = kind === 'branch' ? '支线' : '主线';
+        const key = kind === 'branch' ? 'branch' : 'main';
+        record.values = record.values && typeof record.values === 'object' ? record.values : {};
+        const previousLines = String(record.values[field] || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        const nextLine = String(text || '').trim();
+        const nextText = normalizePlotStoredLines([...previousLines, nextLine]);
+        record.values[field] = nextText;
+        syncPlotItemMetadata(
+            record,
+            key,
+            previousLines,
+            nextText.split(/\n+/).map((line) => line.trim()).filter(Boolean),
+            options
+        );
+        return record;
+    }
+
+    function getPlotKind(value = '') {
+        return /支线/.test(String(value || '')) ? 'branch' : 'main';
+    }
+
+    function splitPlotTimeAndContent(text = '') {
+        const source = String(text || '').trim();
+        if (!source) return { time: '', content: '' };
+        const pattern = /^(.+?(?:\d{1,2}[:：]\d{2})(?:\s*[-~－—至到]\s*\d{1,2}[:：]\d{2})?)\s*[，,、:：\s]\s*([\s\S]+)$/;
+        const match = source.match(pattern);
+        if (!match) return { time: '', content: source };
+        return {
+            time: match[1].replace(/：/g, ':').trim(),
+            content: match[2].trim(),
+        };
+    }
+
+    function getPlotDateFromTimeText(timeText = '') {
+        const normalized = String(timeText || '').trim();
+        if (!normalized) return '';
+        const match = normalized.match(/(?:\d{1,4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/);
+        return match ? match[0].replace(/\s+/g, '') : '';
+    }
+
+    function getPlotClockSortValue(timeText = '') {
+        const match = String(timeText || '').match(/(\d{1,2})[:：](\d{2})/);
+        if (!match) return 999999;
+        return Number(match[1]) * 60 + Number(match[2]);
+    }
+
+    function stripPlotDisplayStatus(content = '') {
+        return String(content || '')
+            .replace(/[\s。；;，,:：]+(?:状态\s*[:：]?\s*|事件\s*)(?:进行中|已完成|已失败)[\s。；;，,:：]*$/g, '')
+            .replace(/^(?:(?:状态\s*[:：]?\s*|事件\s*)?)(?:进行中|已完成|已失败)[\s。；;，,:：]*$/, '')
+            .trim();
+    }
+
+    function movePlotDatePrefixFromContent(time = '', content = '') {
+        const normalizedTime = String(time || '').trim();
+        let normalizedContent = String(content || '').trim();
+        if (getPlotDateFromTimeText(normalizedTime) || !normalizedContent) {
+            return { time: normalizedTime, content: normalizedContent };
+        }
+        const date = getPlotDateFromTimeText(normalizedContent);
+        if (!date) return { time: normalizedTime, content: normalizedContent };
+        const contentClocks = [...normalizedContent.matchAll(/\d{1,2}[:：]\d{2}/g)].map((match) => match[0].replace('：', ':'));
+        const contentTimeRange = contentClocks.length
+            ? `${contentClocks[0]}${contentClocks[1] ? `-${contentClocks[1]}` : ''}`
+            : '';
+        normalizedContent = normalizedContent
+            .replace(new RegExp(`^\\s*${escapeRegExp(date)}\\s*[，,、:：\\s-]*`), '')
+            .replace(/^\d{1,2}[:：]\d{2}(?:\s*[-~－—至到]\s*\d{1,2}[:：]\d{2})?\s*[，,、:：\s-]*/, '')
+            .trim();
+        return {
+            time: normalizedTime ? `${date},${normalizedTime}` : (contentTimeRange ? `${date},${contentTimeRange}` : date),
+            content: normalizedContent,
+        };
+    }
+
+    function normalizePlotStoredLines(lines = []) {
+        if (typeof YuzukiMemory.PlotSummary?.normalizeStoredLines === 'function') {
+            return YuzukiMemory.PlotSummary.normalizeStoredLines(lines);
+        }
+        let lastDate = '';
+        const items = lines
+            .map((line, index) => {
+                const parsed = splitPlotTimeAndContent(line);
+                const text = parsed.time ? `${parsed.time}\t${parsed.content}` : String(line || '').trim();
+                const tabIndex = text.indexOf('\t');
+                const fixed = movePlotDatePrefixFromContent(
+                    (tabIndex > -1 ? text.slice(0, tabIndex) : '').replace(/：/g, ':').trim(),
+                    (tabIndex > -1 ? text.slice(tabIndex + 1) : text).trim()
+                );
+                const content = stripPlotDisplayStatus(fixed.content);
+                if (!fixed.time || !content) return null;
+                const date = getPlotDateFromTimeText(fixed.time) || lastDate;
+                if (date) lastDate = date;
+                const fullTime = getPlotDateFromTimeText(fixed.time) ? fixed.time : (date ? `${date},${fixed.time}` : fixed.time);
+                return {
+                    raw: `${fullTime}\t${content}`,
+                    date: getPlotDateFromTimeText(fullTime) || '',
+                    sort: getPlotClockSortValue(fullTime),
+                    content,
+                    index,
+                };
+            })
+            .filter(Boolean);
+        const seen = new Set();
+        return items
+            .filter((item) => {
+                const key = `${item.date}|${item.sort}|${item.content}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            })
+            .sort((a, b) => String(a.date).localeCompare(String(b.date), 'zh-Hans-CN', { numeric: true }) || a.sort - b.sort || a.index - b.index)
+            .map((item) => item.raw)
+            .join('\n');
+    }
+
+    function createPlotLineId() {
+        return `plot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function normalizePlotLineText(line = '') {
+        return normalizePlotStoredLines([line]).split(/\n+/).map((entry) => entry.trim()).filter(Boolean)[0] || String(line || '').trim();
+    }
+
+    function syncPlotItemMetadata(record, kind, previousLines, nextLines, options = {}) {
+        if (!record) return;
+        const key = kind === 'branch' ? 'branch' : 'main';
+        record.plotItemMeta = record.plotItemMeta && typeof record.plotItemMeta === 'object' ? record.plotItemMeta : {};
+        record.hiddenPlotItems = record.hiddenPlotItems && typeof record.hiddenPlotItems === 'object' ? record.hiddenPlotItems : {};
+
+        const previousMeta = Array.isArray(record.plotItemMeta[key]) ? record.plotItemMeta[key] : [];
+        const previousHidden = Array.isArray(record.hiddenPlotItems[key]) ? record.hiddenPlotItems[key].map(Boolean) : [];
+        const metaByLine = new Map();
+        const hiddenByLine = new Map();
+        previousLines.forEach((line, index) => {
+            const normalized = normalizePlotLineText(line);
+            if (!normalized) return;
+            if (!metaByLine.has(normalized)) metaByLine.set(normalized, []);
+            metaByLine.get(normalized).push(previousMeta[index] || null);
+            if (!hiddenByLine.has(normalized)) hiddenByLine.set(normalized, []);
+            hiddenByLine.get(normalized).push(!!previousHidden[index]);
+        });
+
+        const sourceRange = getRangeMeta(options.range);
+        const floorScope = normalizeFloorScope(options.floorScope, getCurrentFloorScope());
+        record.plotItemMeta[key] = nextLines.map((line) => {
+            const normalized = normalizePlotLineText(line);
+            const existing = metaByLine.get(normalized)?.shift();
+            if (existing) return existing;
+            const metadata = {
+                id: createPlotLineId(),
+                text: normalized,
+            };
+            if (!sourceRange) return metadata;
+            return {
+                ...metadata,
+                source: options.source || 'trace',
+                sourceRange,
+                floorScope,
+                createdAt: Date.now(),
+            };
+        });
+        record.hiddenPlotItems[key] = nextLines.map((line) => {
+            const normalized = normalizePlotLineText(line);
+            return hiddenByLine.get(normalized)?.shift() || false;
+        });
+    }
+
+    function plotValuesToText(values = {}, fallbackTitle = '') {
+        let title = String(values['摘要名称'] || values['标题'] || values.name || values.title || '').trim();
+        if (/^(主线|支线)摘要$/.test(title)) title = '';
+        let date = String(values['日期'] || values['时间'] || values.date || values.time || '').replace(/：/g, ':').trim();
+        let content = String(values['摘要内容'] || values['内容'] || values['总结内容'] || values.content || values.summary || '').trim();
+        if (!date && content) {
+            const parsed = splitPlotTimeAndContent(content);
+            date = parsed.time;
+            content = parsed.content;
+        }
+        const fixed = movePlotDatePrefixFromContent(date, content);
+        date = fixed.time;
+        content = fixed.content;
+        const body = [title, content].filter(Boolean).join('：');
+        return [date, body].filter(Boolean).join('\t').trim();
+    }
+
+    function getRangeMeta(range, fallbackFloorScope = null) {
+        const start = Math.max(0, Math.round(Number(range?.start) || 0));
+        const end = Math.max(start, Math.round(Number(range?.end) || 0));
+        if (end <= start) return null;
+        const floorScope = normalizeFloorScope(range?.floorScope, fallbackFloorScope);
+        return floorScope ? { start, end, floorScope } : { start, end };
+    }
+
+    function isRangeFullyCoveredByTarget(range, target) {
+        return range
+            && target
+            && isSameFloorScope(range.floorScope, target.floorScope)
+            && range.start >= target.start
+            && range.end <= target.end;
+    }
+
+    function isPlotItemCoveredBySummaryTarget(meta, target, fallbackFloorScope = null) {
+        const sourceRange = getRangeMeta(meta?.sourceRange, meta?.floorScope || fallbackFloorScope);
+        if (!sourceRange) return false;
+        // A trace batch is the narrowest reliable floor range stored for a plot
+        // node. Partial overlap is not enough to prove that the node was summarized.
+        return isRangeFullyCoveredByTarget(sourceRange, target);
+    }
+
+    function getRangeLabel(range) {
+        const normalized = getRangeMeta(range);
+        return normalized ? `${normalized.start}-${Math.max(normalized.start, normalized.end - 1)}` : '';
+    }
+
+    function getRangeFloorValue(range) {
+        const normalized = getRangeMeta(range);
+        return normalized ? `${normalized.start}-${Math.max(normalized.start, normalized.end - 1)}` : '';
+    }
+
+    function appendMultilineValue(current, next) {
+        const currentText = String(current || '').trim();
+        const nextText = String(next || '').trim();
+        if (!nextText) return currentText;
+        if (!currentText) return nextText;
+        return `${currentText}\n${nextText}`;
+    }
+
+    function splitMultilineValue(value) {
+        return String(value || '')
+            .split(/\n+/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+    }
+
+    function normalizeBranchCharacterName(value) {
+        return String(value || '').trim().toLowerCase();
+    }
+
+    function findBranchSummaryByCharacter(records = [], character = '') {
+        const key = normalizeBranchCharacterName(character);
+        if (!key) return null;
+        return (Array.isArray(records) ? records : []).find((record) => {
+            const values = record?.values || {};
+            const title = String(values.总结标题 || values.title || '').trim();
+            const recordCharacter = normalizeBranchCharacterName(values.核心角色 || values.character || values.角色名 || values.主视角);
+            return /支线/.test(title) && recordCharacter === key;
+        }) || null;
+    }
+
+    function syncSummarySegmentsToValues(record) {
+        const segments = Array.isArray(record?.summarySegments) ? record.summarySegments : [];
+        if (!segments.length) return;
+        record.values = record.values && typeof record.values === 'object' ? record.values : {};
+        record.values.楼层数 = segments.map((segment) => String(segment.floor || '').trim()).filter(Boolean).join('\n');
+        record.values.总结内容 = segments.map((segment) => String(segment.summary || '').trim()).filter(Boolean).join('\n');
+        record.values.未解决问题 = segments.map((segment) => String(segment.unresolved || '').trim()).filter(Boolean).join('\n');
+        record.values.备注 = segments.map((segment) => String(segment.remark || '').trim()).filter(Boolean).join('\n');
+    }
+
+    function appendSummarySegment(record, values, meta = {}) {
+        record.values = record.values && typeof record.values === 'object' ? record.values : {};
+        const nextFloor = String(values.楼层数 || '').trim();
+        const nextSummary = String(values.总结内容 || '').trim();
+        const recordScope = getRecordFloorScope(record, getCurrentFloorScope());
+        if (!Array.isArray(record.summarySegments) || !record.summarySegments.length) {
+            const previousFloors = splitMultilineValue(record.values.楼层数);
+            const previousSummaryText = String(record.values.总结内容 || '').trim();
+            const previousSummaries = previousFloors.length <= 1
+                ? [previousSummaryText].filter(Boolean)
+                : splitMultilineValue(previousSummaryText);
+            const previousCount = Math.max(previousFloors.length, previousSummaries.length);
+            record.summarySegments = Array.from({ length: previousCount }, (_entry, index) => ({
+                floor: previousFloors[index] || '',
+                summary: previousSummaries[index] || '',
+                range: getRangeMetaFromFloorText(previousFloors[index], recordScope),
+                floorScope: recordScope,
+                summaryType: 'legacy',
+            })).filter((segment) => segment.floor || segment.summary);
+        }
+        const floorScope = normalizeFloorScope(meta.floorScope, getCurrentFloorScope());
+        const range = getRangeMeta(meta.range, floorScope);
+        const segment = {
+            floor: nextFloor,
+            summary: nextSummary,
+            unresolved: String(values.未解决问题 || '').trim(),
+            remark: String(values.备注 || '').trim(),
+            range,
+            floorScope,
+            summaryType: meta.autoTaskType || 'manual',
+            createdAt: Date.now(),
+        };
+        if (nextFloor) {
+            const duplicateIndex = record.summarySegments.findIndex((entry) => (
+                String(entry?.floor || '').trim() === nextFloor
+                && isSameFloorScope(entry?.floorScope || recordScope, floorScope)
+            ));
+            if (duplicateIndex > -1) {
+                record.summarySegments[duplicateIndex] = { ...record.summarySegments[duplicateIndex], ...segment };
+            } else {
+                record.summarySegments.push(segment);
+            }
+        } else {
+            record.summarySegments.push(segment);
+        }
+        syncSummarySegmentsToValues(record);
+    }
+
+    function isBlankSummaryRecord(record) {
+        const values = record?.values || {};
+        return !String(values.总结内容 || values.summary || '').trim()
+            && !String(values.未解决问题 || values.unresolved || '').trim()
+            && !String(values.备注 || values.remark || '').trim()
+            && !String(values.楼层数 || values.range || '').trim();
+    }
+
+    function findReusableSummaryPlaceholder(records = [], primary = '总结标题', label = '主线总结') {
+        return (Array.isArray(records) ? records : []).find((record) => {
+            const title = String(record?.values?.[primary] || '').trim();
+            return title === label && isBlankSummaryRecord(record) && !record?.meta?.yzmMemoryTask;
+        }) || null;
+    }
+
+    function getSummaryRecordTaskMeta(record) {
+        const task = record?.meta?.yzmMemoryTask;
+        return task && typeof task === 'object' ? task : null;
+    }
+
+    function getSummaryRecordFloorRange(record) {
+        const values = record?.values || {};
+        const rawRange = String(values.楼层数 || values.range || values['楼层范围'] || values['楼层'] || '').trim();
+        const match = rawRange.match(/(\d+)\s*(?:-|~|－|—|至|到)\s*(\d+)/);
+        if (!match) return null;
+        const start = Math.max(0, Math.round(Number(match[1]) || 0));
+        const end = Math.max(start, Math.round(Number(match[2]) || 0));
+        return end > start ? { start, end, floorScope: getRecordFloorScope(record) } : null;
+    }
+
+    function parseSummaryFloorBounds(value) {
+        const source = String(value || '').trim();
+        if (!source) return [];
+        const ranges = [...source.matchAll(/(\d+)\s*(?:-|~|－|—|至|到)\s*(\d+)/g)].map((match) => {
+            const first = Math.max(0, Math.round(Number(match[1]) || 0));
+            const second = Math.max(0, Math.round(Number(match[2]) || 0));
+            return { start: Math.min(first, second), end: Math.max(first, second) };
+        });
+        if (ranges.length) return ranges;
+        if (!/^\d+$/.test(source)) return [];
+        const floor = Math.max(0, Math.round(Number(source) || 0));
+        return [{ start: floor, end: floor }];
+    }
+
+    function getSummaryRecordOptimizeRanges(record, fallbackFloorScope = null) {
+        const recordScope = getRecordFloorScope(record, fallbackFloorScope);
+        const ranges = [];
+        const appendFloorText = (value, floorScope = recordScope) => {
+            parseSummaryFloorBounds(value).forEach((range) => ranges.push({
+                ...range,
+                floorScope: normalizeFloorScope(floorScope, recordScope),
+            }));
+        };
+        const appendStoredRange = (range, floorScope = recordScope) => {
+            const normalized = getRangeMeta(range, floorScope);
+            if (!normalized) return;
+            ranges.push({
+                start: normalized.start,
+                end: Math.max(normalized.start, normalized.end - 1),
+                floorScope: normalizeFloorScope(normalized.floorScope, floorScope),
+            });
+        };
+
+        if (Array.isArray(record?.summarySegments) && record.summarySegments.length) {
+            record.summarySegments.forEach((segment) => {
+                const before = ranges.length;
+                appendFloorText(segment?.floor || segment?.楼层数 || segment?.rangeLabel, segment?.floorScope || recordScope);
+                if (ranges.length === before) appendStoredRange(segment?.range, segment?.floorScope || recordScope);
+            });
+            if (ranges.length) return ranges;
+        }
+
+        const values = record?.values || {};
+        appendFloorText(values.楼层数 || values.range || values['楼层范围'] || values['楼层'], recordScope);
+        if (ranges.length) return ranges;
+        const task = getSummaryRecordTaskMeta(record);
+        appendStoredRange(task?.range, task?.floorScope || recordScope);
+        return ranges;
+    }
+
+    function getSummaryOptimizeRange(records = [], state = null) {
+        const fallbackFloorScope = getCurrentFloorScope(state);
+        const recordRanges = (Array.isArray(records) ? records : []).map((record) => (
+            getSummaryRecordOptimizeRanges(record, fallbackFloorScope)
+        ));
+        const knownRanges = recordRanges.flat();
+        if (!knownRanges.length) {
+            return { range: null, floorScope: fallbackFloorScope, floorText: '', missingCount: recordRanges.length };
+        }
+        const missingCount = recordRanges.filter((ranges) => !ranges.length).length;
+        if (missingCount) {
+            return {
+                range: null,
+                floorScope: fallbackFloorScope,
+                floorText: '',
+                missingCount,
+                error: `所选总结中有 ${missingCount} 条缺少楼层范围，无法安全计算合并后的范围。`,
+            };
+        }
+        const scopeIds = new Set(knownRanges
+            .map((range) => normalizeFloorScope(range.floorScope, fallbackFloorScope)?.id || '')
+            .filter(Boolean));
+        if (scopeIds.size > 1) {
+            return {
+                range: null,
+                floorScope: null,
+                floorText: '',
+                missingCount: 0,
+                error: '所选总结跨越不同篇章，不能合并为同一个楼层范围。',
+            };
+        }
+        const start = Math.min(...knownRanges.map((range) => range.start));
+        const end = Math.max(...knownRanges.map((range) => range.end));
+        const floorScope = normalizeFloorScope(knownRanges[0]?.floorScope, fallbackFloorScope);
+        return {
+            range: getRangeMeta({ start, end: end + 1, floorScope }, floorScope),
+            floorScope,
+            floorText: `${start}-${end}`,
+            missingCount: 0,
+        };
+    }
+
+    function getRangeMetaFromFloorText(value, floorScope = null) {
+        const match = String(value || '').match(/(\d+)\s*(?:-|~|－|—|至|到)\s*(\d+)/);
+        if (!match) return null;
+        return getRangeMeta({ start: Number(match[1]), end: Number(match[2]) }, floorScope);
+    }
+
+    function getSummarySegmentRange(segment, fallbackFloorScope = null) {
+        const segmentScope = normalizeFloorScope(segment?.floorScope, fallbackFloorScope);
+        const range = getRangeMeta(segment?.range, segmentScope);
+        if (range) return range;
+        const rawRange = String(segment?.floor || segment?.楼层数 || segment?.rangeLabel || '').trim();
+        const match = rawRange.match(/(\d+)\s*(?:-|~|－|—|至|到)\s*(\d+)/);
+        if (!match) return null;
+        const start = Math.max(0, Math.round(Number(match[1]) || 0));
+        const end = Math.max(start, Math.round(Number(match[2]) || 0));
+        return end > start ? { start, end, floorScope: segmentScope } : null;
+    }
+
+    function isSmallSummaryRecord(record, table, task) {
+        if (task?.summaryType === 'history' || task?.summaryType === 'optimize') return false;
+        return Boolean(getSummaryRecordFloorRange(record));
+    }
+
+    function isSummaryCoveredByRange(record, table, targetRange) {
+        const task = getSummaryRecordTaskMeta(record);
+        const recordRange = getRangeMeta(task?.range, task?.floorScope || getRecordFloorScope(record)) || getSummaryRecordFloorRange(record);
+        return isSmallSummaryRecord(record, table, task)
+            && recordRange
+            && isSameFloorScope(recordRange.floorScope, targetRange.floorScope)
+            && recordRange.start >= targetRange.start
+            && recordRange.end <= targetRange.end;
+    }
+
+    function getTitleRecordsForSummary(records = [], table = null, meta = {}) {
+        if (meta.autoTaskType !== 'history') return records;
+        const targetRange = getRangeMeta(meta.range, meta.floorScope || getCurrentFloorScope());
+        if (!targetRange) return records;
+        return (Array.isArray(records) ? records : []).filter((record) => !isSummaryCoveredByRange(record, table, targetRange));
+    }
+
+    function getSummaryRecordTitle(payload, records = [], table = null, meta = {}) {
+        const label = payload.kind === 'branch' ? '支线总结' : '主线总结';
+        return getNextSummaryTitle(table, getTitleRecordsForSummary(records, table, meta), label);
+    }
+
+    function upsertSummaryRecord(state, payload, meta = {}) {
+        const table = stateTables(state).find((entry) => entry.id === FIXED_SUMMARY_TABLE_ID);
+        if (!table) return null;
+        state.records = state.records && typeof state.records === 'object' ? state.records : {};
+        state.records[table.id] = Array.isArray(state.records[table.id]) ? state.records[table.id] : [];
+        const records = state.records[table.id];
+        const floorScope = normalizeFloorScope(meta.floorScope, getCurrentFloorScope(state));
+        meta = { ...meta, floorScope };
+        const title = getSummaryRecordTitle(payload, records, table, meta);
+        const rangeLabel = getRangeLabel(meta.range);
+        const floorValue = getRangeFloorValue(meta.range);
+        const isAutoSummaryRecord = meta.autoTaskType === 'summary' || meta.autoTaskType === 'history';
+        const values = {
+            [getPrimaryColumn(table)]: title,
+            核心角色: payload.kind === 'branch' ? payload.character : '',
+            楼层数: floorValue,
+            总结内容: payload.summary,
+            未解决问题: payload.unresolved,
+            备注: payload.remark,
+        };
+        const primary = getPrimaryColumn(table);
+        const shouldGroupBranch = payload.kind === 'branch' && values.核心角色;
+        let record = shouldGroupBranch ? findBranchSummaryByCharacter(records, values.核心角色) : null;
+        if (!record) record = records.find((entry) => String(entry?.values?.[primary] || '').trim() === title);
+        if (!record) {
+            const label = payload.kind === 'branch' ? '支线总结' : '主线总结';
+            record = findReusableSummaryPlaceholder(records, primary, label);
+        }
+        if (record) {
+            record.values = record.values && typeof record.values === 'object' ? record.values : {};
+            record.values[primary] = shouldGroupBranch ? (record.values[primary] || title) : title;
+            if (isAutoSummaryRecord && !shouldGroupBranch) {
+                record.floorScope = floorScope;
+                record.values.核心角色 = values.核心角色;
+                record.values.楼层数 = values.楼层数;
+                record.values.总结内容 = values.总结内容;
+                record.values.未解决问题 = values.未解决问题;
+                record.values.备注 = values.备注;
+            } else {
+                record.values.核心角色 = values.核心角色 || record.values.核心角色 || '';
+                appendSummarySegment(record, values, meta);
+            }
+        } else {
+            record = createRecord(table, values);
+            record.floorScope = floorScope;
+            if (shouldGroupBranch) {
+                record.values.楼层数 = '';
+                record.values.总结内容 = '';
+                record.values.未解决问题 = '';
+                record.values.备注 = '';
+                record.summarySegments = [];
+                appendSummarySegment(record, values, meta);
+            }
+            records.push(record);
+        }
+        if (rangeLabel || meta.autoTaskType) {
+            record.meta = {
+                ...(record.meta || {}),
+                yzmMemoryTask: {
+                    kind: 'summary',
+                    summaryType: meta.autoTaskType || 'manual',
+                    range: getRangeMeta(meta.range, floorScope),
+                    floorScope,
+                    createdAt: Date.now(),
+                },
+            };
+        }
+        return record;
+    }
+
+    function getNextSummaryTitle(table, records = [], label = '主线总结') {
+        const primary = getPrimaryColumn(table);
+        const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const numberedTitlePattern = new RegExp(`^${escapedLabel}（(\\d+)）$`);
+        const maxIndex = (Array.isArray(records) ? records : []).reduce((max, record) => {
+            const title = String(record?.values?.[primary] || '').trim();
+            const numberedMatch = title.match(numberedTitlePattern);
+            if (numberedMatch) return Math.max(max, Number(numberedMatch[1]) || 0);
+            if (title === label && !isBlankSummaryRecord(record)) return Math.max(max, 1);
+            return max;
+        }, 0);
+        return `${label}（${maxIndex + 1}）`;
+    }
+
+    function getSummaryRecordKind(record) {
+        const values = record?.values || {};
+        const title = String(values.总结标题 || values.title || '').trim();
+        return /支线/.test(title) ? 'branch' : 'main';
+    }
+
+    function getSummaryRecordPayload(table, record) {
+        const values = record?.values || {};
+        return {
+            kind: getSummaryRecordKind(record),
+            title: String(values[getPrimaryColumn(table)] || values.总结标题 || '').trim(),
+            character: String(values.核心角色 || values.character || '').trim(),
+            summary: String(values.总结内容 || values.summary || '').trim(),
+            unresolved: String(values.未解决问题 || values.unresolved || '').trim(),
+            remark: String(values.备注 || values.remark || '').trim(),
+        };
+    }
+
+    function summaryRecordToOptimizeText(table, record, index = 0) {
+        const payload = getSummaryRecordPayload(table, record);
+        const floorText = String(record?.values?.楼层数 || '').trim();
+        return compactLines([
+            `【目标 ${index + 1}】`,
+            `recordId: ${record?.id || ''}`,
+            `类型: ${payload.kind === 'branch' ? '支线' : '主线'}`,
+            payload.title ? `标题: ${payload.title}` : '',
+            payload.character ? `核心角色: ${payload.character}` : '',
+            floorText ? `楼层: ${floorText}` : '',
+            payload.summary ? `总结内容:\n${payload.summary}` : '',
+            payload.unresolved ? `未解决问题:\n${payload.unresolved}` : '',
+            payload.remark ? `备注:\n${payload.remark}` : '',
+        ]);
+    }
+
+    function getSummaryOptimizeTargets(state, options = {}) {
+        const table = stateTables(state).find((entry) => entry.id === FIXED_SUMMARY_TABLE_ID);
+        if (!table) return { table: null, records: [] };
+        const selectedIds = new Set((Array.isArray(options.summaryRecordIds) ? options.summaryRecordIds : [])
+            .map((id) => String(id || '').trim())
+            .filter(Boolean));
+        const targetKind = String(options.summaryTarget || options.tableId || 'all');
+        const records = stateRecords(state, FIXED_SUMMARY_TABLE_ID)
+            .filter((record) => record)
+            .filter((record) => String(record?.values?.总结内容 || record?.values?.summary || '').trim())
+            .filter((record) => !selectedIds.size || selectedIds.has(String(record.id || '')))
+            .filter((record) => selectedIds.size || targetKind === 'all' || getSummaryRecordKind(record) === targetKind);
+        return { table, records };
+    }
+
+    function cleanupSmallAutoSummaries(state, range, keepRecordIds = []) {
+        const table = stateTables(state).find((entry) => entry.id === FIXED_SUMMARY_TABLE_ID);
+        const records = stateRecords(state, FIXED_SUMMARY_TABLE_ID);
+        if (!table || !records.length) return 0;
+        const target = getRangeMeta(range, getCurrentFloorScope(state));
+        if (!target) return 0;
+        const keepIds = new Set((Array.isArray(keepRecordIds) ? keepRecordIds : [keepRecordIds]).filter(Boolean).map(String));
+        let cleanupCount = 0;
+        const nextRecords = records.filter((record) => {
+            const shouldKeepRecord = keepIds.has(String(record?.id || ''));
+            if (Array.isArray(record?.summarySegments) && record.summarySegments.length) {
+                const before = record.summarySegments.length;
+                const recordScope = getRecordFloorScope(record, target.floorScope);
+                record.summarySegments = record.summarySegments.filter((segment) => {
+                    const segmentRange = getSummarySegmentRange(segment, recordScope);
+                    const protectedHistorySegment = shouldKeepRecord
+                        && (segment.summaryType === 'history' || segment.summaryType === 'optimize');
+                    const isCovered = segmentRange
+                        && isSameFloorScope(segmentRange.floorScope, target.floorScope)
+                        && segmentRange.start >= target.start
+                        && segmentRange.end <= target.end
+                        && !protectedHistorySegment;
+                    return !isCovered;
+                });
+                cleanupCount += before - record.summarySegments.length;
+                if (record.summarySegments.length) {
+                    syncSummarySegmentsToValues(record);
+                    return true;
+                }
+                if (shouldKeepRecord) return true;
+                if (before !== record.summarySegments.length) return false;
+            }
+            if (shouldKeepRecord) return true;
+            const task = getSummaryRecordTaskMeta(record);
+            const recordRange = getRangeMeta(task?.range, task?.floorScope || getRecordFloorScope(record)) || getSummaryRecordFloorRange(record);
+            if (!isSmallSummaryRecord(record, table, task) || !recordRange) return true;
+            const covered = isSameFloorScope(recordRange.floorScope, target.floorScope)
+                && recordRange.start >= target.start
+                && recordRange.end <= target.end;
+            if (covered) cleanupCount += 1;
+            return !covered;
+        });
+        state.records[table.id] = nextRecords;
+        return cleanupCount;
+    }
+
+    function isSameSummaryRange(candidateRange, targetRange) {
+        const candidate = getRangeMeta(candidateRange);
+        const target = getRangeMeta(targetRange);
+        if (!candidate || !target || !isSameFloorScope(candidate.floorScope, target.floorScope) || candidate.start !== target.start) return false;
+        return candidate.end === target.end || candidate.end === target.end - 1;
+    }
+
+    function findExistingHistorySummaryRecords(state, range) {
+        const target = getRangeMeta(range, getCurrentFloorScope(state));
+        if (!target) return [];
+        return stateRecords(state, FIXED_SUMMARY_TABLE_ID).filter((record) => {
+            if (!String(record?.values?.总结内容 || record?.values?.summary || '').trim()) return false;
+            const task = getSummaryRecordTaskMeta(record);
+            if (task?.summaryType !== 'history') return false;
+            const taskRange = getRangeMeta(task?.range, task?.floorScope || getRecordFloorScope(record));
+            if (taskRange) return isSameSummaryRange(taskRange, target);
+            return isSameSummaryRange(getSummaryRecordFloorRange(record), target);
+        });
+    }
+
+    function hidePlotSummaryItemsCoveredByRange(state, range, summaryRecordIds = []) {
+        const target = getRangeMeta(range, getCurrentFloorScope(state));
+        if (!target) return 0;
+        const records = stateRecords(state, PLOT_SUMMARY_TABLE_ID);
+        if (!records.length) return 0;
+        const coveredBySummaryIds = (Array.isArray(summaryRecordIds) ? summaryRecordIds : [summaryRecordIds])
+            .map((id) => String(id || '').trim())
+            .filter(Boolean);
+        let hiddenCount = 0;
+        records.forEach((record) => {
+            const recordFloorScope = getRecordFloorScope(record);
+            record.plotItemMeta = record.plotItemMeta && typeof record.plotItemMeta === 'object' ? record.plotItemMeta : {};
+            record.hiddenPlotItems = record.hiddenPlotItems && typeof record.hiddenPlotItems === 'object' ? record.hiddenPlotItems : {};
+            ['main', 'branch'].forEach((kind) => {
+                const field = kind === 'branch' ? '支线' : '主线';
+                const lineCount = String(record?.values?.[field] || '').split(/\n+/).map((line) => line.trim()).filter(Boolean).length;
+                if (!lineCount) return;
+                const metaList = Array.isArray(record.plotItemMeta[kind]) ? record.plotItemMeta[kind] : [];
+                while (metaList.length < lineCount) metaList.push({});
+                if (metaList.length > lineCount) metaList.length = lineCount;
+                record.plotItemMeta[kind] = metaList;
+                const hiddenStates = Array.isArray(record.hiddenPlotItems[kind])
+                    ? record.hiddenPlotItems[kind].map(Boolean)
+                    : Array.from({ length: lineCount }, () => false);
+                while (hiddenStates.length < lineCount) hiddenStates.push(false);
+                if (hiddenStates.length > lineCount) hiddenStates.length = lineCount;
+                metaList.slice(0, lineCount).forEach((meta, index) => {
+                    const covered = isPlotItemCoveredBySummaryTarget(meta, target, recordFloorScope);
+                    if (!covered || hiddenStates[index]) return;
+                    hiddenStates[index] = true;
+                    meta.hiddenReason = 'covered_by_summary';
+                    meta.coveredBySummaryIds = coveredBySummaryIds;
+                    meta.hiddenAt = Date.now();
+                    hiddenCount += 1;
+                });
+                record.hiddenPlotItems[kind] = hiddenStates;
+            });
+        });
+        return hiddenCount;
+    }
+
+    function hidePlotSummaryItemsCoveredByExistingSummaries(state) {
+        const table = stateTables(state).find((entry) => entry.id === FIXED_SUMMARY_TABLE_ID);
+        const summaryRecords = table ? stateRecords(state, FIXED_SUMMARY_TABLE_ID) : [];
+        const coverageTargets = [];
+        summaryRecords.forEach((record) => {
+            if (!String(record?.values?.总结内容 || record?.values?.summary || '').trim()) return;
+            const recordId = String(record?.id || '').trim();
+            const ranges = [];
+            const task = getSummaryRecordTaskMeta(record);
+            const taskRange = getRangeMeta(task?.range, task?.floorScope || getRecordFloorScope(record));
+            const floorRange = getSummaryRecordFloorRange(record);
+            if (taskRange) ranges.push(taskRange);
+            else if (floorRange) ranges.push(floorRange);
+            if (Array.isArray(record?.summarySegments)) {
+                record.summarySegments.forEach((segment) => {
+                    const segmentRange = getSummarySegmentRange(segment);
+                    if (segmentRange) ranges.push(segmentRange);
+                });
+            }
+            const seen = new Set();
+            ranges.forEach((range) => {
+                const key = `${range.floorScope?.id || ''}:${range.start}-${range.end}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                coverageTargets.push({ range, recordId });
+            });
+        });
+
+        let changedCount = 0;
+        stateRecords(state, PLOT_SUMMARY_TABLE_ID).forEach((record) => {
+            const recordFloorScope = getRecordFloorScope(record);
+            record.plotItemMeta = record.plotItemMeta && typeof record.plotItemMeta === 'object' ? record.plotItemMeta : {};
+            record.hiddenPlotItems = record.hiddenPlotItems && typeof record.hiddenPlotItems === 'object' ? record.hiddenPlotItems : {};
+            ['main', 'branch'].forEach((kind) => {
+                const field = kind === 'branch' ? '支线' : '主线';
+                const lineCount = String(record?.values?.[field] || '').split(/\n+/).map((line) => line.trim()).filter(Boolean).length;
+                if (!lineCount) return;
+                const metaList = Array.isArray(record.plotItemMeta[kind]) ? record.plotItemMeta[kind] : [];
+                while (metaList.length < lineCount) metaList.push({});
+                if (metaList.length > lineCount) metaList.length = lineCount;
+                record.plotItemMeta[kind] = metaList;
+                const hiddenStates = Array.isArray(record.hiddenPlotItems[kind])
+                    ? record.hiddenPlotItems[kind].map(Boolean)
+                    : Array.from({ length: lineCount }, () => false);
+                while (hiddenStates.length < lineCount) hiddenStates.push(false);
+                if (hiddenStates.length > lineCount) hiddenStates.length = lineCount;
+
+                metaList.forEach((rawMeta, index) => {
+                    const meta = rawMeta && typeof rawMeta === 'object' ? rawMeta : {};
+                    metaList[index] = meta;
+                    const coveringTargets = coverageTargets.filter((target) => (
+                        isPlotItemCoveredBySummaryTarget(meta, target.range, recordFloorScope)
+                    ));
+                    const wasSummaryHidden = meta.hiddenReason === 'covered_by_summary';
+                    let changed = false;
+
+                    if (coveringTargets.length) {
+                        // Preserve an explicit manual hide without converting it into
+                        // an automatic hide that may later be cleared with a summary.
+                        if (hiddenStates[index] && !wasSummaryHidden) return;
+                        const coveredBySummaryIds = [...new Set(coveringTargets.map((target) => target.recordId).filter(Boolean))];
+                        const previousIds = Array.isArray(meta.coveredBySummaryIds)
+                            ? meta.coveredBySummaryIds.map(String)
+                            : [];
+                        const idsChanged = previousIds.length !== coveredBySummaryIds.length
+                            || previousIds.some((id, idIndex) => id !== coveredBySummaryIds[idIndex]);
+                        if (!hiddenStates[index]) {
+                            hiddenStates[index] = true;
+                            changed = true;
+                        }
+                        if (!wasSummaryHidden || idsChanged) {
+                            meta.hiddenReason = 'covered_by_summary';
+                            meta.coveredBySummaryIds = coveredBySummaryIds;
+                            meta.hiddenAt = Number(meta.hiddenAt) || Date.now();
+                            changed = true;
+                        }
+                    } else if (wasSummaryHidden) {
+                        if (hiddenStates[index]) {
+                            hiddenStates[index] = false;
+                            changed = true;
+                        }
+                        delete meta.hiddenReason;
+                        delete meta.coveredBySummaryIds;
+                        delete meta.hiddenAt;
+                        changed = true;
+                    }
+
+                    if (changed) changedCount += 1;
+                });
+                record.hiddenPlotItems[kind] = hiddenStates;
+            });
+        });
+        return changedCount;
+    }
+
+    function applyTraceResult(state, resultRows, options = {}) {
+        const targetTable = getOptionTargetTable(state, options);
+        if (resultRows?.memoryRows && YuzukiMemory.MemoryTagParser?.applyRowsToState) {
+            const memoryRows = targetTable
+                ? resultRows.memoryRows
+                    .map((row) => row && !String(row.table || '').trim() ? { ...row, table: targetTable.name } : row)
+                    .filter((row) => findTargetTable(state, row?.table)?.id === targetTable.id)
+                : resultRows.memoryRows;
+            if (targetTable && !memoryRows.length) return 0;
+            return YuzukiMemory.MemoryTagParser.applyRowsToState(state, memoryRows, {
+                source: options.source || 'trace',
+                range: options.range,
+                floorScope: options.floorScope || getCurrentFloorScope(state),
+            });
+        }
+        const rows = normalizeTaskRows(resultRows)
+            .map((row) => targetTable && !row.table ? { ...row, table: targetTable.name } : row)
+            .filter((row) => !targetTable || findTargetTable(state, row.table)?.id === targetTable.id);
+        let count = 0;
+        rows.forEach((row) => {
+            const table = findTargetTable(state, row.table);
+            if (!table) return;
+            if (table.id === PLOT_SUMMARY_TABLE_ID) {
+                const text = plotValuesToText(row.values, row.values?.[getPrimaryColumn(table)] || row.values?.primaryValue || row.table);
+                if (!text) return;
+                appendPlotSummary(
+                    state,
+                    text,
+                    getPlotKind([row.table, row.values?.kind, row.values?.type, row.values?.分类, row.values?.类别, row.values?.[getPrimaryColumn(table)]].filter(Boolean).join(' ')),
+                    {
+                        source: options.source || 'trace',
+                        range: options.range,
+                        floorScope: options.floorScope || getCurrentFloorScope(state),
+                    }
+                );
+                count += 1;
+                return;
+            }
+            if (upsertRecord(state, table, row.values)) count += 1;
+        });
+        return count;
+    }
+
+    function commitTraceResult(state, result) {
+        const count = applyTraceResult(state, result?.parsed, {
+            source: result?.meta?.autoTaskType || 'trace',
+            range: result?.range,
+            floorScope: result?.meta?.floorScope || getCurrentFloorScope(state),
+            tableId: result?.meta?.tableId || result?.tableId || '',
+        });
+        if (!count) {
+            return {
+                ...result,
+                success: false,
+                count: 0,
+                error: '批量填表没有解析到有效更新，已跳过写入，避免清空或覆盖现有表格。',
+            };
+        }
+        const hiddenPlotSummaryCount = hidePlotSummaryItemsCoveredByExistingSummaries(state);
+        return { ...result, success: true, count, hiddenPlotSummaryCount };
+    }
+
+    function commitSummaryResult(state, result) {
+        const payloads = Array.isArray(result?.payloads) ? result.payloads : [result?.payload].filter(Boolean);
+        const validPayloads = payloads.filter((payload) => payload?.summary);
+        if (!validPayloads.length) return { ...result, success: false, error: '总结结果缺少 summary/总结内容。' };
+        const records = validPayloads.map((payload) => upsertSummaryRecord(state, payload, result?.meta)).filter(Boolean);
+        const hiddenPlotSummaryCount = hidePlotSummaryItemsCoveredByExistingSummaries(state);
+        return { ...result, success: true, count: records.length, record: records[0] || null, records, hiddenPlotSummaryCount };
+    }
+
+    function commitSummaryOptimizeResult(state, result) {
+        const targets = Array.isArray(result?.targets) ? result.targets : [];
+        const payloads = (Array.isArray(result?.payloads) ? result.payloads : [result?.payload].filter(Boolean)).filter((payload) => payload?.summary);
+        if (!payloads.length) return { ...result, success: false, error: '优化结果缺少 summary/总结内容。' };
+        const table = stateTables(state).find((entry) => entry.id === FIXED_SUMMARY_TABLE_ID);
+        if (!table) return { ...result, success: false, error: '未找到记忆总结表。' };
+        if (!targets.length) return { ...result, success: false, error: '优化结果缺少原总结目标，已取消写入以避免误删数据。' };
+        state.records = state.records && typeof state.records === 'object' ? state.records : {};
+        const records = stateRecords(state, FIXED_SUMMARY_TABLE_ID);
+        const removeIds = new Set(targets.map((target) => String(target?.id || '')).filter(Boolean));
+        const sourceRecords = records.filter((record) => removeIds.has(String(record?.id || '')));
+        if (sourceRecords.length !== removeIds.size) {
+            return { ...result, success: false, error: '部分原总结已发生变化，已取消写入以避免误删数据。' };
+        }
+        const calculatedRange = getSummaryOptimizeRange(sourceRecords, state);
+        if (calculatedRange.error) return { ...result, success: false, error: calculatedRange.error };
+        const range = calculatedRange.range;
+        const floorScope = normalizeFloorScope(result?.meta?.floorScope, calculatedRange.floorScope || getCurrentFloorScope(state));
+        state.records[FIXED_SUMMARY_TABLE_ID] = records.filter((record) => !removeIds.has(String(record?.id || '')));
+        const created = payloads.map((payload) => upsertSummaryRecord(state, payload, {
+            autoTaskType: 'optimize',
+            range,
+            floorScope,
+        })).filter(Boolean);
+        if (created.length !== payloads.length) {
+            state.records[FIXED_SUMMARY_TABLE_ID] = records;
+            return { ...result, success: false, count: 0, error: '优化结果没有完整写入全部新总结，原总结未被替换。' };
+        }
+        return {
+            ...result,
+            success: true,
+            count: created.length,
+            record: created[0] || null,
+            records: created,
+            removedCount: sourceRecords.length,
+            range,
+            floorText: calculatedRange.floorText || result?.floorText || '',
+        };
+    }
+
+    function rebuildTaskResultFromText(action, originalResult = {}, editedText = '') {
+        const text = String(editedText || '').trim();
+        if (!text) return { ...originalResult, success: false, error: '编辑后的结果为空。' };
+        if (action === 'trace' || action === 'traceOptimize') {
+            const parsed = parseTraceResponse(text);
+            return {
+                ...originalResult,
+                success: true,
+                parsed,
+                preview: getTracePreview(parsed),
+                text,
+            };
+        }
+        if (action === 'summary' || action === 'summaryOptimize') {
+            const validatedResponse = validateSummaryGenerationResponse({ success: true, text });
+            if (!validatedResponse.success) {
+                return {
+                    ...originalResult,
+                    success: false,
+                    error: validatedResponse.error,
+                    text,
+                };
+            }
+            const payloads = parseSummaryResponse(validatedResponse.text);
+            return {
+                ...originalResult,
+                success: true,
+                payload: payloads[0],
+                payloads,
+                preview: payloads.map((payload) => getSummaryPreview(payload)).filter(Boolean).join('\n\n'),
+                text: validatedResponse.text,
+            };
+        }
+        return { ...originalResult, success: true, text };
+    }
+
+    function getDefaultTracePrompt(state, options = {}) {
+        return `你是记忆表格追溯助手。请阅读聊天记录，提取应该写入记忆表格的信息。
+只输出 JSON，不要解释。格式：
+{"records":[{"table":"表名或表ID","values":{"字段名":"字段值"}}]}
+
+{{DATABASE_SCHEMA}}`;
+    }
+
+    function getDefaultSummaryPrompt() {
+        return `你是剧情总结助手。请总结给定聊天范围。
+输出必须使用 <Memory>...</Memory> 包裹；标签外不要输出任何内容。
+格式：
+<Memory>
+【主线总结】
+YYYY年MM月DD日,HH:mm-HH:mm [地点] 事件闭环描述
+
+【支线总结：角色名】
+YYYY年MM月DD日,HH:mm-HH:mm [地点] 角色名 事件闭环描述
+</Memory>
+规则：
+1. 可以同时输出一个主线总结和多个支线总结分块；没有内容的分块不要输出。
+2. 分块正文是记忆总结详情页唯一展示内容；多段剧情用换行分隔。
+3. 同一天内多段内容只在第一段写 YYYY年MM月DD日，后续同日段落只写 HH:mm-HH:mm；跨天时再写新的日期。
+4. 主线必须使用标题【主线总结】。
+5. 支线必须使用标题【支线总结：角色名】，角色名只能填写一个具体角色名；不要写组织名、势力名、事件名、分类名或多个角色名。
+6. 已有支线核心角色：{{BRANCH_SUMMARY_NAMES}}。如果新增支线剧情的核心角色已经在此列表中，标题中的角色名必须复用列表里的原名字，不要改写成别名、称号或其他近似名字；只有确实是其他具体角色时，才新增新的支线核心角色名。
+7. 主线和支线不要记录同一事件。`;
+    }
+
+    function getTracePromptFromScheme(scheme) {
+        const prompts = scheme?.prompts || {};
+        return String(prompts.traceBatch || '');
+    }
+
+    function getDefaultOptimizePrompt(kind = 'trace') {
+        if (kind === 'summary') {
+            return `你是总结优化助手。请整理现有总结，合并重复、修正冲突、补全内容脉络。
+只输出 <Memory>...</Memory>，不要解释，不要 Markdown。
+格式：
+<Memory>
+【主线总结】
+优化后的主线总结正文
+
+【支线总结：角色名】
+优化后的支线总结正文
+</Memory>
+规则：
+1. 无论输入几条总结，同一主线只输出一个主线分块，同一核心角色的支线只输出一个支线分块。
+2. 原总结中确实包含独立角色支线时，即使输入只有一条主线，也可以在保留主线的同时新增对应支线分块；不得编造没有依据的支线。
+3. 多条合并优化必须覆盖被选中旧总结里的关键事实，不要只输出增量差异；同一事件最终只能保留在一个分块中。
+4. 主线分块标题必须是【主线总结】。
+5. 支线分块标题必须是【支线总结：角色名】，且只能填写一个具体角色名；不要写组织名、势力名、事件名、分类名或多个角色名。
+6. 分块正文必须是最终可直接落盘的内容。楼层范围由插件本地绑定，不要输出或猜测楼层范围。`;
+        }
+        return `你是记忆表格优化助手。请整理现有表格内容，合并重复、修正冲突。只输出 JSON，格式同追溯任务。`;
+    }
+
+    function getSummaryOptimizeResponseFormatPrompt() {
+        return `请按以下格式回复，且只输出 <Memory>...</Memory>，不要解释，不要 Markdown：
+<Memory>
+【主线总结】
+优化后的主线总结正文
+
+【支线总结：角色名】
+优化后的支线总结正文
+</Memory>
+同一主线只输出一个主线分块，同一核心角色的支线只输出一个支线分块。原总结中确实包含独立角色支线时，即使输入只有一条主线，也可以新增对应支线分块，但不得编造。多条合并结果必须覆盖被选中旧总结里的关键事实，不要只输出增量差异。分块正文必须是最终可直接落盘的内容。支线标题中的角色名只能填写一个具体角色名，不要写组织名、势力名、事件名、分类名或多个角色名。楼层范围由插件本地绑定，不要输出或猜测。`;
+    }
+
+    function buildTaskRangeText(range, kind = 'trace') {
+        const start = Math.max(0, Math.round(Number(range?.start) || 0));
+        const end = Math.max(start, Math.round(Number(range?.end) || 0));
+        const total = Math.max(0, Math.round(Number(range?.total) || 0));
+        const lastFloor = Math.max(0, total - 1);
+        const label = kind === 'summary' ? '总结' : '追溯填表';
+        return compactLines([
+            `【本次${label}任务】`,
+            `处理楼层范围：${start} ~ ${end}（左闭右开，不含 ${end}）`,
+            `当前总楼层：${total}；最高楼层号：${lastFloor}。`,
+            `实际处理聊天条目数：${Array.isArray(range?.messages) ? range.messages.length : 0}`,
+            '聊天内容已按原始楼层编号标注为 [楼层 N]。',
+        ]);
+    }
+
+    async function buildTraceMessages(state, options = {}) {
+        const scheme = getActivePromptScheme(state);
+        const range = chatMessagesFromRange(options.start, options.end);
+        const taskPromptOptions = {
+            ...options,
+            suppressMemoryData: true,
+        };
+        const historianPrompt = resolveTaskPromptVariables(scheme?.prompts?.historian || '', state, taskPromptOptions);
+        const tracePrompt = resolveTaskPromptVariables(getTracePromptFromScheme(scheme) || getDefaultTracePrompt(state, options), state, taskPromptOptions);
+        const targetRestriction = buildTraceTargetRestrictionText(state, options);
+        const worldbookMessage = await buildWorldbookContextMessage(state, options);
+        const messages = normalizeTaskMessages([
+            { role: 'system', content: historianPrompt },
+            { role: 'system', content: buildRuntimeBackgroundText() },
+            worldbookMessage,
+            { role: 'system', content: buildTaskRangeText(range, 'trace') },
+            ...range.messages,
+            { role: 'system', content: tracePrompt },
+            targetRestriction ? { role: 'system', content: targetRestriction } : null,
+            { role: 'user', content: '请立即根据以上待追溯聊天内容和批量追溯填表提示词执行任务。' },
+        ]);
+        return { messages, range };
+    }
+
+    async function buildSummaryMessages(state, options = {}) {
+        const scheme = getActivePromptScheme(state);
+        const range = chatMessagesFromRange(options.start, options.end);
+        const historianPrompt = resolveTaskPromptVariables(scheme?.prompts?.historian || '', state, {
+            ...options,
+            suppressMemoryTables: true,
+        });
+        const summaryPrompt = resolveTaskPromptVariables(scheme?.prompts?.summary || getDefaultSummaryPrompt(), state, {
+            ...options,
+            suppressMemoryTables: true,
+        });
+        const worldbookMessage = await buildWorldbookContextMessage(state, options);
+        const messages = normalizeTaskMessages([
+            { role: 'system', content: historianPrompt },
+            { role: 'system', content: buildRuntimeBackgroundText({ includeChatSummary: false }) },
+            worldbookMessage,
+            { role: 'system', content: buildTaskRangeText(range, 'summary') },
+            ...range.messages,
+            { role: 'system', content: summaryPrompt },
+            { role: 'user', content: '请立即根据以上待总结聊天内容和总结提示词执行任务。不得遗漏最后结尾</Memory>标签。' },
+        ]);
+        return { messages, range };
+    }
+
+    function buildRecentChatContextMessage(options = {}) {
+        if (options.optimizeContextEnabled !== true) return null;
+        const chatLength = getChatLength();
+        if (!chatLength) return null;
+        const count = Math.min(Math.max(1, Math.round(Number(options.optimizeContextCount) || 10)), 200);
+        const start = Math.max(0, chatLength - count);
+        const range = chatMessagesFromRange(start, chatLength);
+        if (!range.messages.length) return null;
+        return {
+            role: 'system',
+            content: [
+                `【最近聊天上下文】以下为当前聊天最后 ${range.messages.length} 条可用消息，仅用于辅助判断待优化表格的称呼、状态和时间顺序；不得据此编造待优化表格中没有依据的新条目。`,
+                ...range.messages.map((message) => message.content),
+            ].join('\n'),
+        };
+    }
+
+    async function runTrace(state, options = {}) {
+        const built = await buildTraceMessages(state, options);
+        if (!built.range.messages.length) return { success: false, error: '范围内无有效聊天内容。' };
+        const response = await generate(built.messages, { ...options, kind: 'trace' });
+        if (!response.success) return response;
+        const parsed = filterTraceResultByTarget(state, parseTraceResponse(response.text), options);
+        const result = {
+            success: true,
+            kind: 'trace',
+            parsed,
+            preview: getTracePreview(parsed),
+            text: response.text,
+            range: built.range,
+            meta: {
+                tableId: String(options.tableId || ''),
+                autoTaskType: options.autoTaskType || '',
+                floorScope: normalizeFloorScope(options.floorScope, getCurrentFloorScope(state)),
+            },
+        };
+        return options.previewOnly ? result : commitTraceResult(state, result);
+    }
+
+    async function runSummary(state, options = {}) {
+        const built = await buildSummaryMessages(state, options);
+        if (!built.range.messages.length) return { success: false, error: '范围内无有效聊天内容。' };
+        const response = await generate(built.messages, { ...options, kind: 'summary' });
+        if (!response.success) return response;
+        const validatedResponse = validateSummaryGenerationResponse(response);
+        if (!validatedResponse.success) return validatedResponse;
+        const payloads = parseSummaryResponse(validatedResponse.text);
+        if (!payloads.length) return { success: false, error: formatSummaryParseError('总结结果缺少可落盘的分块正文。', response.text), text: response.text };
+        const result = {
+            success: true,
+            kind: 'summary',
+            payload: payloads[0],
+            payloads,
+            preview: payloads.map((payload) => getSummaryPreview(payload)).filter(Boolean).join('\n\n'),
+            text: validatedResponse.text,
+            range: built.range,
+            meta: {
+                autoTaskType: options.autoTaskType || '',
+                range: { start: built.range.start, end: built.range.end },
+                floorScope: normalizeFloorScope(options.floorScope, getCurrentFloorScope(state)),
+            },
+        };
+        return options.previewOnly ? result : commitSummaryResult(state, result);
+    }
+
+    async function runTraceOptimize(state, options = {}) {
+        const scheme = getActivePromptScheme(state);
+        const prompt = resolveTaskPromptVariables(compactLines([scheme?.prompts?.traceOptimize, getDefaultOptimizePrompt('trace')]), state, options);
+        const historianPrompt = resolveTaskPromptVariables(scheme?.prompts?.historian || '', state, {
+            ...options,
+            suppressMemoryData: true,
+        });
+        const recentContextMessage = buildRecentChatContextMessage(options);
+        const worldbookMessage = await buildWorldbookContextMessage(state, options);
+        const note = String(options.note || '').trim();
+        const tableText = tablesToReferenceText(state, options) || '（暂无）';
+        const messages = normalizeTaskMessages([
+            historianPrompt ? { role: 'system', content: historianPrompt } : null,
+            { role: 'system', content: buildRuntimeBackgroundText() },
+            worldbookMessage,
+            recentContextMessage,
+            { role: 'system', content: `【待优化表格】\n${tableText}` },
+            { role: 'user', content: `${prompt}${note ? `\n\n【本次重点优化建议】\n${note}` : ''}\n\n请根据以上待优化表格和优化要求输出优化后的结果。` },
+        ]);
+        const response = await generate(messages, { ...options, kind: 'traceOptimize' });
+        if (!response.success) return response;
+        const parsed = parseTraceResponse(response.text);
+        const result = { success: true, kind: 'trace', parsed, preview: getTracePreview(parsed), text: response.text };
+        return options.previewOnly ? result : commitTraceResult(state, result);
+    }
+
+    async function runSummaryOptimize(state, options = {}) {
+        const targetInfo = getSummaryOptimizeTargets(state, options);
+        if (!targetInfo.records.length) return { success: false, error: '没有可优化的总结内容。' };
+        const optimizeRange = getSummaryOptimizeRange(targetInfo.records, state);
+        if (optimizeRange.error) return { success: false, error: optimizeRange.error };
+        const summaries = targetInfo.records
+            .map((record, index) => summaryRecordToOptimizeText(targetInfo.table, record, index))
+            .filter(Boolean)
+            .join('\n\n');
+        const note = String(options.note || '').trim();
+        const scheme = getActivePromptScheme(state);
+        const historianPrompt = resolveTaskPromptVariables(scheme?.prompts?.historian || '', state, {
+            ...options,
+            suppressMemoryTables: true,
+        });
+        const schemePrompt = scheme?.prompts?.summaryOptimize;
+        const promptSource = note
+            ? compactLines([`【本次重点优化建议】\n${note}`, getSummaryOptimizeResponseFormatPrompt()])
+            : (schemePrompt || getDefaultOptimizePrompt('summary'));
+        const prompt = resolveTaskPromptVariables(promptSource, state, options);
+        const worldbookMessage = await buildWorldbookContextMessage(state, options);
+        const messages = normalizeTaskMessages([
+            { role: 'system', content: historianPrompt },
+            { role: 'system', content: buildRuntimeBackgroundText({ includeChatSummary: false }) },
+            worldbookMessage,
+            { role: 'user', content: `【待优化总结】\n${summaries || '（暂无）'}` },
+            { role: 'system', content: prompt },
+            { role: 'user', content: '请立即根据以上待优化总结和优化要求输出优化后的 <Memory> 总结。' },
+        ]);
+        const response = await generate(messages, { ...options, kind: 'summaryOptimize' });
+        if (!response.success) return response;
+        const validatedResponse = validateSummaryGenerationResponse(response);
+        if (!validatedResponse.success) return validatedResponse;
+        const payloads = parseSummaryResponse(validatedResponse.text);
+        if (!payloads.length) return { success: false, error: formatSummaryParseError('优化结果缺少可落盘的分块正文。', response.text), text: response.text };
+        const result = {
+            success: true,
+            kind: 'summary',
+            payload: payloads[0],
+            payloads,
+            preview: payloads.map((payload) => getSummaryPreview(payload)).filter(Boolean).join('\n\n'),
+            text: validatedResponse.text,
+            range: optimizeRange.range,
+            floorText: optimizeRange.floorText,
+            targets: targetInfo.records.map((record) => ({
+                id: record.id,
+                kind: getSummaryRecordKind(record),
+                title: String(record?.values?.[getPrimaryColumn(targetInfo.table)] || record?.values?.总结标题 || '').trim(),
+                floorText: String(record?.values?.楼层数 || record?.values?.range || record?.values?.['楼层范围'] || '').trim(),
+                oldPayload: getSummaryRecordPayload(targetInfo.table, record),
+                oldText: summaryRecordToOptimizeText(targetInfo.table, record, 0),
+            })),
+            meta: {
+                autoTaskType: '',
+                range: optimizeRange.range,
+                floorScope: optimizeRange.floorScope,
+            },
+        };
+        return options.previewOnly ? result : commitSummaryOptimizeResult(state, result);
+    }
+
+    async function runTagDiagnostic(options = {}) {
+        const latest = getLatestAssistantChatMessage();
+        if (!latest) return { success: false, error: '未找到聊天记录中的 assistant 回复。' };
+
+        const rawText = String(latest.text || '');
+        if (!rawText.includes('<') && !rawText.includes('[')) {
+            return {
+                success: true,
+                noTags: true,
+                floor: latest.index,
+                rawText,
+                blacklist: [],
+                whitelist: [],
+                reasoning: '最后一条 assistant 回复中未检测到明显的 XML (<>) 或方括号 ([]) 标签格式。',
+            };
+        }
+
+        const prompt = AI_TAG_DIAGNOSTIC_PROMPT.replace('{{RAW_TEXT}}', rawText);
+        const response = await generate([{ role: 'user', content: prompt }], {
+            ...options,
+            kind: 'tagDiagnostic',
+            silent: true,
+        });
+        if (!response.success) return response;
+
+        const parsed = parseJsonBlock(response.text);
+        return {
+            success: true,
+            floor: latest.index,
+            rawText,
+            text: response.text,
+            reasoning: String(parsed?.reasoning || '').trim(),
+            blacklist: normalizeTagList(parsed?.blacklist),
+            whitelist: normalizeTagList(parsed?.whitelist),
+        };
+    }
+
+    function getAutoSummarySettings() {
+        const source = parseJsonStorage(AUTO_SUMMARY_SETTINGS_STORAGE_KEY, {});
+        const settings = {
+            summaryEnabled: source.summaryEnabled !== false,
+            summaryEvery: Math.max(1, Math.round(Number(source.summaryEvery) || 20)),
+            historyEnabled: source.historyEnabled !== false,
+            historyEvery: Math.max(1, Math.round(Number(source.historyEvery) || 100)),
+            summaryDelay: Math.max(0, Math.round(Number(source.summaryDelay) || 2)),
+            historyDelay: Math.max(0, Math.round(Number(source.historyDelay) || 3)),
+            directTrigger: typeof source.directTrigger === 'boolean' ? source.directTrigger : true,
+            autoSave: typeof source.autoSave === 'boolean' ? source.autoSave : true,
+            autoVectorizeAfterHistory: typeof source.autoVectorizeAfterHistory === 'boolean' ? source.autoVectorizeAfterHistory : false,
+            autoSyncSummaryWorldbook: typeof source.autoSyncSummaryWorldbook === 'boolean' ? source.autoSyncSummaryWorldbook : false,
+            hideSummaryFloors: typeof source.hideSummaryFloors === 'boolean' ? source.hideSummaryFloors : false,
+        };
+        if (settings.autoVectorizeAfterHistory && settings.autoSyncSummaryWorldbook) {
+            settings.autoSyncSummaryWorldbook = false;
+        }
+        return settings;
+    }
+
+    function normalizePointers(state) {
+        state.settings = state.settings && typeof state.settings === 'object' ? state.settings : {};
+        const source = state.settings.manualPointers && typeof state.settings.manualPointers === 'object'
+            ? state.settings.manualPointers
+            : {};
+        const pointers = {
+            ...source,
+            trace: Math.max(0, Math.round(Number(source.trace) || 0)),
+            summary: Math.max(0, Math.round(Number(source.summary) || 0)),
+            historySummary: Math.max(0, Math.round(Number(source.historySummary ?? source.bigSummary) || 0)),
+        };
+        state.settings.manualPointers = pointers;
+        return pointers;
+    }
+
+    function clampPointersToChatLength(chatLength = getChatLength(), reason = 'chat_length') {
+        const state = autoTaskCallbacks.getState?.();
+        if (!state) return false;
+
+        const limit = Math.max(0, Math.round(Number(chatLength) || 0));
+        const pointers = normalizePointers(state);
+        const previous = {
+            trace: pointers.trace,
+            summary: pointers.summary,
+            historySummary: pointers.historySummary,
+        };
+
+        pointers.trace = Math.min(pointers.trace, limit);
+        pointers.summary = Math.min(pointers.summary, limit);
+        pointers.historySummary = Math.min(pointers.historySummary, limit);
+
+        const changed = pointers.trace !== previous.trace
+            || pointers.summary !== previous.summary
+            || pointers.historySummary !== previous.historySummary;
+        if (!changed) return false;
+
+        const saved = autoTaskCallbacks.saveState?.({ immediate: true, saveOrigin: 'pointer-clamp' });
+        console.info('[yuzuki-Memory] 聊天楼层减少，已回退任务指针。', {
+            reason,
+            chatLength: limit,
+            previous,
+            current: {
+                trace: pointers.trace,
+                summary: pointers.summary,
+                historySummary: pointers.historySummary,
+            },
+            saved,
+        });
+        return saved !== false;
+    }
+
+    function buildAutoTask(type, pointers, chatLength, settings) {
+        const isHistory = type === 'history';
+        const enabled = isHistory ? settings.historyEnabled : settings.summaryEnabled;
+        if (!enabled) return null;
+        const pointerKey = isHistory ? 'historySummary' : 'summary';
+        const lastIndex = Math.max(0, Number(pointers[pointerKey]) || 0);
+        const interval = isHistory ? settings.historyEvery : settings.summaryEvery;
+        const delay = isHistory ? settings.historyDelay : settings.summaryDelay;
+        const threshold = interval + delay;
+        if (chatLength - lastIndex < threshold) return null;
+        return {
+            type,
+            pointerKey,
+            title: isHistory ? '自动大总结' : '自动小总结',
+            lastIndex,
+            currentCount: chatLength,
+            interval,
+            delay,
+            threshold,
+            start: lastIndex,
+            end: Math.min(lastIndex + interval, chatLength),
+        };
+    }
+
+    function buildAutoTraceTask(pointers, chatLength, settings) {
+        if (settings.enableFilling === false || settings.fillMode !== 'batch' || !settings.traceBatchEnabled) return null;
+        const lastIndex = Math.max(0, Number(pointers.trace) || 0);
+        const interval = Math.max(1, Number(settings.autoTraceBatchSize ?? settings.traceBatchSize) || 40);
+        const delay = Math.max(0, Number(settings.traceBatchDelay) || 0);
+        const threshold = interval + delay;
+        if (chatLength - lastIndex < threshold) return null;
+        return {
+            type: 'trace',
+            pointerKey: 'trace',
+            title: '自动批量填表',
+            lastIndex,
+            currentCount: chatLength,
+            interval,
+            delay,
+            threshold,
+            start: lastIndex,
+            end: Math.min(lastIndex + interval, chatLength),
+        };
+    }
+
+    function buildPendingAutoTask(pointers, chatLength, settings, pluginSettings, options = {}) {
+        const skippedTypes = new Set(Array.isArray(options.skippedTypes) ? options.skippedTypes : []);
+        const traceTask = buildAutoTraceTask(pointers, chatLength, pluginSettings);
+        if (traceTask && !skippedTypes.has(traceTask.type)) return traceTask;
+        const historyTask = buildAutoTask('history', pointers, chatLength, settings);
+        if (historyTask && !skippedTypes.has(historyTask.type)) return historyTask;
+        const summaryTask = buildAutoTask('summary', pointers, chatLength, settings);
+        if (summaryTask && !skippedTypes.has(summaryTask.type)) return summaryTask;
+        return null;
+    }
+
+    async function confirmAutoTask(task, callbacks = {}) {
+        if (settingsSupportsDirect(callbacks) && callbacks.confirmAutoTask) {
+            return callbacks.confirmAutoTask(task);
+        }
+        if (typeof window.confirm !== 'function') return { action: 'confirm', postpone: 0 };
+        const ok = window.confirm(`${task.title}已达到触发条件。\n当前楼层：${task.currentCount}\n上次指针：${task.lastIndex}\n触发阈值：${task.threshold}\n处理楼层：${formatDisplayFloorRange(task.start, task.end)}\n\n是否执行？`);
+        return { action: ok ? 'confirm' : 'cancel', postpone: 0 };
+    }
+
+    function settingsSupportsDirect(callbacks) {
+        return callbacks && typeof callbacks.confirmAutoTask === 'function';
+    }
+
+    async function confirmTaskResult(result, task, callbacks = {}) {
+        if (typeof callbacks.confirmTaskResult === 'function') {
+            return callbacks.confirmTaskResult(result, task);
+        }
+        if (typeof window.confirm !== 'function') return true;
+        return window.confirm(`${task?.title || '任务'}已生成结果，是否写入记忆？\n\n${String(result.text || result.preview || '').slice(0, 1000)}`);
+    }
+
+    function isTaskResultConfirmationCancelled(confirmation) {
+        return !confirmation
+            || confirmation.cancelled === true
+            || confirmation.action === 'cancel';
+    }
+
+    async function runAutoSummaryTask(state, task, settings, callbacks = {}) {
+        if (task.type === 'history') {
+            const existingRecords = findExistingHistorySummaryRecords(state, { start: task.start, end: task.end });
+            const existingRecord = existingRecords[0] || null;
+            if (existingRecord) {
+                const cleanupCount = cleanupSmallAutoSummaries(
+                    state,
+                    { start: task.start, end: task.end, floorScope: existingRecord.floorScope || task.floorScope },
+                    existingRecords.map((record) => record.id).filter(Boolean)
+                );
+                const pointers = normalizePointers(state);
+                pointers.historySummary = Math.max(pointers.historySummary, task.end);
+                if (pointers.summary < pointers.historySummary) pointers.summary = pointers.historySummary;
+                callbacks.saveState?.();
+                callbacks.onUpdate?.({
+                    success: true,
+                    skipped: true,
+                    duplicate: true,
+                    cleanupCount,
+                    range: { start: task.start, end: task.end },
+                    record: existingRecord,
+                });
+                console.info(`[yuzuki-Memory] 自动大总结 ${formatDisplayFloorRange(task.start, task.end)} 已存在，已推进大/小总结指针。`);
+                return {
+                    success: true,
+                    skipped: true,
+                    duplicate: true,
+                    cleanupCount,
+                    range: { start: task.start, end: task.end },
+                    record: existingRecord,
+                };
+            }
+        }
+
+        const shouldRun = settings.directTrigger ? { action: 'confirm', postpone: 0 } : await confirmAutoTask(task, callbacks);
+        if (shouldRun?.action !== 'confirm') return { skipped: true };
+        if (Number(shouldRun.postpone) > 0) {
+            const pointers = normalizePointers(state);
+            pointers[task.pointerKey] = Math.max(0, task.currentCount - task.threshold + Math.round(Number(shouldRun.postpone) || 0));
+            callbacks.saveState?.();
+            return { postponed: true };
+        }
+
+        const result = await runSummary(state, {
+            start: task.start,
+            end: task.end,
+            silent: settings.autoSave,
+            previewOnly: !settings.autoSave,
+            autoTaskType: task.type,
+        });
+        if (!result.success) return result;
+
+        let committed = result;
+        if (!settings.autoSave) {
+            const confirmation = await confirmTaskResult(result, task, callbacks);
+            if (isTaskResultConfirmationCancelled(confirmation)) return { success: true, skipped: true, result };
+            committed = confirmation && typeof confirmation === 'object' && 'text' in confirmation
+                ? rebuildTaskResultFromText('summary', result, confirmation.text)
+                : result;
+            if (!committed.success) return committed;
+            committed = commitSummaryResult(state, committed);
+        }
+
+        const pointers = normalizePointers(state);
+        pointers[task.pointerKey] = committed.range?.end || task.end;
+        if (task.type === 'history' && pointers.summary < pointers.historySummary) pointers.summary = pointers.historySummary;
+        if (task.type === 'summary' || task.type === 'history') {
+            committed.hiddenPlotSummaryCount = hidePlotSummaryItemsCoveredByRange(
+                state,
+                { start: task.start, end: task.end },
+                (Array.isArray(committed.records) ? committed.records : [committed.record]).map((record) => record?.id).filter(Boolean)
+            );
+        }
+        const savedBeforeFloorHiding = callbacks.saveState?.();
+        if (settings.hideSummaryFloors) {
+            if (savedBeforeFloorHiding === false) {
+                committed.hideResult = {
+                    success: false,
+                    skipped: true,
+                    reason: 'state_save_failed',
+                    error: '总结结果尚未落盘，已跳过自动隐藏楼层。',
+                };
+            } else {
+                committed.hideResult = await YuzukiMemory.FloorHider?.applySummaryPointerHiding?.({
+                    force: true,
+                    summaryPointer: pointers.summary,
+                });
+            }
+        }
+        if (task.type === 'history') {
+            committed.cleanupCount = cleanupSmallAutoSummaries(
+                state,
+                {
+                    start: committed.range?.start ?? task.start,
+                    end: committed.range?.end ?? task.end,
+                    floorScope: committed.meta?.floorScope || task.floorScope,
+                },
+                (Array.isArray(committed.records) ? committed.records : [committed.record]).map((record) => record?.id).filter(Boolean)
+            );
+            callbacks.saveState?.();
+        }
+        if (settings.autoVectorizeAfterHistory === true && typeof callbacks.syncSummaryToVectorBook === 'function') {
+            try {
+                committed.vectorSyncResult = await callbacks.syncSummaryToVectorBook({ vectorize: true });
+            } catch (error) {
+                committed.vectorSyncResult = { success: false, error: String(error?.message || error || '总结同步向量化失败') };
+                console.warn('[yuzuki-Memory] Auto summary vector sync failed:', error);
+            }
+        }
+        if (settings.autoSyncSummaryWorldbook === true && typeof callbacks.syncSummaryToWorldbook === 'function') {
+            try {
+                committed.worldbookSyncResult = await callbacks.syncSummaryToWorldbook();
+            } catch (error) {
+                committed.worldbookSyncResult = { success: false, error: String(error?.message || error || '总结同步世界书失败') };
+                console.warn('[yuzuki-Memory] Auto summary worldbook sync failed:', error);
+            }
+        }
+        callbacks.saveState?.();
+        callbacks.onUpdate?.(committed);
+        return committed;
+    }
+
+    async function runAutoTraceTask(state, task, callbacks = {}) {
+        const pluginSettings = getPluginSettings();
+
+        const autoSave = pluginSettings.traceRunMode === 'silent';
+        if (!autoSave) {
+            const shouldRun = await confirmAutoTask(task, callbacks);
+            if (shouldRun?.action !== 'confirm') return { skipped: true };
+            if (Number(shouldRun.postpone) > 0) {
+                const pointers = normalizePointers(state);
+                pointers.trace = Math.max(0, task.currentCount - task.threshold + Math.round(Number(shouldRun.postpone) || 0));
+                callbacks.saveState?.();
+                return { postponed: true };
+            }
+        }
+        notifyAutoTaskStarted(task);
+        const result = await runTrace(state, {
+            start: task.start,
+            end: task.end,
+            silent: autoSave,
+            previewOnly: !autoSave,
+            autoTaskType: 'trace',
+        });
+        if (!result.success) return { ...result, range: result.range || { start: task.start, end: task.end } };
+
+        let committed = result;
+        if (!autoSave) {
+            const confirmation = await confirmTaskResult(result, task, callbacks);
+            if (isTaskResultConfirmationCancelled(confirmation)) return { success: true, skipped: true, result };
+            committed = confirmation && typeof confirmation === 'object' && 'text' in confirmation
+                ? rebuildTaskResultFromText('trace', result, confirmation.text)
+                : result;
+            if (!committed.success) return committed;
+            committed = commitTraceResult(state, committed);
+        }
+
+        const pointers = normalizePointers(state);
+        pointers.trace = committed.range?.end || task.end;
+        callbacks.saveState?.();
+        callbacks.onUpdate?.(committed);
+        return committed;
+    }
+
+    function scheduleAutoSummary(callbacks = {}, delayMs = AUTO_TASK_MESSAGE_STABLE_MS) {
+        if (!autoTaskArmed) return;
+        window.clearTimeout(autoSummaryTimer);
+        autoSummaryTimer = window.setTimeout(async () => {
+            if (!autoTaskArmed) return;
+            if (!isAutoTaskStateReady(callbacks)) {
+                autoTaskArmed = false;
+                return;
+            }
+            const currentSessionId = getCurrentSessionId();
+            const chatLength = getChatLength();
+            if (!currentSessionId || currentSessionId !== autoTaskSessionId) {
+                refreshAutoTaskBaseline();
+                return;
+            }
+            if (chatLength <= autoTaskBaselineChatLength) {
+                autoTaskArmed = false;
+                autoTaskBaselineChatLength = chatLength;
+                return;
+            }
+            if (isManualTaskBusy()) {
+                autoTaskArmed = false;
+                return;
+            }
+            if (isPluginTaskBusy()) {
+                autoTaskArmed = false;
+                return;
+            }
+            if (!isLatestAssistantMessageStable()) {
+                scheduleAutoSummary(callbacks, AUTO_TASK_MESSAGE_STABLE_MS);
+                return;
+            }
+            const state = callbacks.getState?.();
+            if (!state) {
+                autoTaskArmed = false;
+                return;
+            }
+            const settings = getAutoSummarySettings();
+            const pluginSettings = getPluginSettings();
+            const pointers = normalizePointers(state);
+            const task = buildPendingAutoTask(pointers, chatLength, settings, pluginSettings);
+            if (!task) {
+                autoTaskArmed = false;
+                autoTaskBaselineChatLength = chatLength;
+                return;
+            }
+
+            autoSummaryRunning = true;
+            const skippedTypes = new Set();
+            try {
+                let activeTask = task;
+                let activeState = state;
+                while (activeTask) {
+                    autoSummaryPromptOpen = activeTask.type === 'trace'
+                        ? pluginSettings.traceRunMode !== 'silent'
+                        : (!settings.directTrigger || !settings.autoSave);
+                    const result = activeTask.type === 'trace'
+                        ? await runAutoTraceTask(activeState, activeTask, callbacks)
+                        : await runAutoSummaryTask(activeState, activeTask, settings, callbacks);
+                    if (result?.success === false) {
+                        console.warn('[yuzuki-Memory] Auto task skipped:', result.error);
+                        notifyAutoTaskFailure(activeTask, result.error, callbacks);
+                        break;
+                    }
+                    if (result?.skipped || result?.postponed) {
+                        skippedTypes.add(activeTask.type);
+                        activeState = callbacks.getState?.() || activeState;
+                        activeTask = buildPendingAutoTask(
+                            normalizePointers(activeState),
+                            getChatLength(),
+                            settings,
+                            pluginSettings,
+                            { skippedTypes: [...skippedTypes] }
+                        );
+                        continue;
+                    }
+
+                    notifyAutoTaskSuccess(activeTask, result);
+                    break;
+                }
+            } catch (error) {
+                console.warn('[yuzuki-Memory] Auto task failed:', error);
+                notifyAutoTaskFailure(task, error, callbacks);
+            } finally {
+                autoSummaryRunning = false;
+                autoSummaryPromptOpen = false;
+                autoTaskBaselineChatLength = getChatLength();
+                autoTaskArmed = false;
+            }
+        }, delayMs);
+    }
+
+    function armAutoTaskAfterGeneration(callbacks = {}) {
+        if (!isAutoTaskStateReady(callbacks)) return;
+        const currentSessionId = getCurrentSessionId();
+        const chatLength = getChatLength();
+        if (!currentSessionId) return;
+        if (currentSessionId !== autoTaskSessionId) {
+            refreshAutoTaskBaseline();
+            return;
+        }
+        if (!isLatestAssistantMessage()) return;
+        if (chatLength <= autoTaskBaselineChatLength) return;
+        autoTaskArmed = true;
+        markLatestAssistantMessageActivity();
+        scheduleAutoSummary(callbacks);
+    }
+
+    function bindAutoSummary(callbacks = {}) {
+        autoTaskCallbacks = callbacks;
+        if (autoSummaryBound) return;
+        autoSummaryBound = true;
+        refreshAutoTaskBaseline();
+        clampPointersToChatLength(getChatLength(), 'bind');
+        const ctx = getContext();
+        const eventSource = ctx?.eventSource;
+        const eventTypes = ctx?.event_types;
+        if (eventSource && eventTypes) {
+            const onCharacterRendered = () => {
+                markLatestAssistantMessageActivity();
+                armAutoTaskAfterGeneration(callbacks);
+            };
+            const onMessageDeleted = (chatLength) => {
+                clampPointersToChatLength(chatLength, 'message_deleted');
+                refreshAutoTaskBaseline();
+            };
+            if (eventTypes.CHARACTER_MESSAGE_RENDERED) eventSource.on?.(eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterRendered);
+            if (eventTypes.MESSAGE_DELETED) eventSource.on?.(eventTypes.MESSAGE_DELETED, onMessageDeleted);
+        }
+        window.addEventListener('yzm-memory-session-ready', () => {
+            refreshAutoTaskBaseline();
+            clampPointersToChatLength(getChatLength(), 'session_ready');
+        });
+        autoTaskSessionPollTimer = window.setInterval(() => {
+            const currentSessionId = getCurrentSessionId();
+            if (currentSessionId && currentSessionId !== autoTaskSessionId) {
+                refreshAutoTaskBaseline();
+            }
+        }, 1500);
+    }
+
+    YuzukiMemory.TaskRunner = Object.assign(YuzukiMemory.TaskRunner || {}, {
+        filterContentByTags,
+        runTrace,
+        runSummary,
+        runTraceOptimize,
+        runSummaryOptimize,
+        runTagDiagnostic,
+        commitTraceResult,
+        commitSummaryResult,
+        commitSummaryOptimizeResult,
+        rebuildTaskResultFromText,
+        createLlmRequestSnapshot,
+        cleanupSmallAutoSummaries,
+        hidePlotSummaryItemsCoveredByExistingSummaries,
+        bindAutoSummary,
+        cancelPendingAutoTask,
+    });
+})();

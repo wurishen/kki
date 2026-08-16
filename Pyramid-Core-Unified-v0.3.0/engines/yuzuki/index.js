@@ -1,0 +1,93 @@
+﻿// ============================================================================
+// yuzuki-Memory
+// SillyTavern memory table plugin entry.
+// Keep this file as the loader/bootstrap only; feature logic belongs in modules.
+// ============================================================================
+(function () {
+    'use strict';
+
+    const NAMESPACE = 'YuzukiMemory';
+    const VERSION = '0.7.2';
+    const baseUrl = new URL('./', import.meta.url).href;
+
+    const MODULES = [
+        'config/global-settings.js',
+        'config/storage.js',
+        'config/character-name-matcher.js',
+        'config/character-graph.js',
+        'config/memory-io.js',
+        'config/plot-summary.js',
+        'config/memory-tag-parser.js',
+        'config/branch-snapshot.js',
+        'config/todo-manager.js',
+        'config/prompt-library.js',
+        'config/prompt-scheme-io.js',
+        'config/llm-client.js',
+        'config/worldbook-manager.js',
+        'config/task-runner.js',
+        'config/embedding-client.js',
+        'config/rerank-client.js',
+        'config/vector-store.js',
+        'config/floor-hider.js',
+        'config/variable-injector.js',
+        'config/prompt-ready-injector.js',
+        'config/request-probe.js',
+        'config/log-viewer.js',
+        'ui/character-graph-window.js',
+        'ui/memory-window.js',
+    ];
+
+    if (window[NAMESPACE]?.loaded) {
+        console.warn('[yuzuki-Memory] Already loaded, skipping duplicate init.');
+        return;
+    }
+
+    window[NAMESPACE] = Object.assign(window[NAMESPACE] || {}, {
+        loaded: true,
+        version: VERSION,
+        baseUrl,
+    });
+
+    function resolveModule(path) {
+        const url = new URL(path, baseUrl);
+        url.searchParams.set('v', VERSION);
+        return url.href;
+    }
+
+    function loadScript(path) {
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = resolveModule(path);
+            script.async = false;
+            script.dataset.yzmModule = path;
+            script.onload = () => resolve(path);
+            script.onerror = () => reject(new Error(`Failed to load module: ${path}`));
+            document.head.appendChild(script);
+        });
+    }
+
+    function onDomReady(callback) {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', callback, { once: true });
+            return;
+        }
+        callback();
+    }
+
+    async function bootstrap() {
+        try {
+            for (const modulePath of MODULES) {
+                await loadScript(modulePath);
+            }
+
+            onDomReady(() => {
+                window[NAMESPACE].MemoryWindow?.mount?.();
+                console.log(`[yuzuki-Memory] v${VERSION} ready.`);
+            });
+        } catch (error) {
+            console.error('[yuzuki-Memory] Startup failed.', error);
+        }
+    }
+
+    bootstrap();
+})();
